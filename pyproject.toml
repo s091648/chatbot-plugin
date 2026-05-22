@@ -8,9 +8,14 @@ dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "pydantic>=2.0",
+    "pydantic-settings>=2.0",
     "structlog",
-    "sqlalchemy",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg",
     "anthropic",
+    "langchain>=0.3",
+    "langchain-anthropic>=0.3",
+    "langchain-google-genai>=2.0",
 ]
 
 [dependency-groups]

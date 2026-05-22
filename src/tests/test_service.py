@@ -1,37 +1,117 @@
 """Tests for ChatbotService."""
 
 import pytest
+from unittest.mock import AsyncMock, patch, MagicMock
+from fastapi import HTTPException
 
 from chatbot_plugin.service import ChatbotService
+from chatbot_plugin.contracts import ChatMessageResponse, SearchResponse
 
 
 @pytest.fixture
-def service() -> ChatbotService:
-    return ChatbotService()
+def mock_db():
+    """Mock async DB session."""
+    db = AsyncMock()
+    return db
+
+
+@pytest.fixture
+def service(mock_db) -> ChatbotService:
+    return ChatbotService(mock_db)
+
+
+# ── chat() ──
+
+@pytest.mark.asyncio
+async def test_chat_returns_reply_and_articles(service, mock_db):
+    mock_rows = [
+        {"id": "uuid-1", "title": "RAG Article", "content": "RAG content...", "rank": 0.5},
+    ]
+    mock_db.execute.return_value = MagicMock(mappings=MagicMock(
+        all=lambda: mock_rows
+    ))
+
+    with patch("chatbot_plugin.service.rag_generate", new_callable=AsyncMock) as mock_llm:
+        mock_llm.return_value = "RAG is retrieval-augmented generation."
+        result = await service.chat("What is RAG?")
+
+    assert isinstance(result, ChatMessageResponse)
+    assert "RAG" in result.reply
+    assert len(result.articles_used) == 1
+    assert result.articles_used[0].title == "RAG Article"
 
 
 @pytest.mark.asyncio
-async def test_chat_returns_reply(service: ChatbotService):
-    result = await service.chat("hello")
-    assert result.reply
-    assert isinstance(result.articles_used, list)
+async def test_chat_no_articles_still_generates(service, mock_db):
+    mock_db.execute.return_value = MagicMock(mappings=MagicMock(all=lambda: []))
+
+    with patch("chatbot_plugin.service.rag_generate", new_callable=AsyncMock) as mock_llm:
+        mock_llm.return_value = "I don't have specific articles on that."
+        result = await service.chat("obscure topic")
+
+    assert result.articles_used == []
 
 
 @pytest.mark.asyncio
-async def test_search_returns_chunks(service: ChatbotService):
-    result = await service.search("RAG")
-    assert isinstance(result.chunks, list)
+async def test_chat_llm_failure_raises_503(service, mock_db):
+    mock_db.execute.return_value = MagicMock(mappings=MagicMock(all=lambda: []))
+
+    with patch("chatbot_plugin.service.rag_generate", new_callable=AsyncMock) as mock_llm:
+        mock_llm.side_effect = Exception("LLM timeout")
+        with pytest.raises(HTTPException) as exc_info:
+            await service.chat("hello")
+        assert exc_info.value.status_code == 503
+
+
+# ── search() ──
+
+@pytest.mark.asyncio
+async def test_search_returns_chunks(service, mock_db):
+    mock_rows = [
+        {"id": "uuid-1", "title": "Article A", "content": "Content A", "rank": 0.8},
+        {"id": "uuid-2", "title": "Article B", "content": "Content B", "rank": 0.5},
+    ]
+    mock_db.execute.return_value = MagicMock(mappings=MagicMock(all=lambda: mock_rows))
+
+    result = await service.search("RAG", top_k=10)
+    assert isinstance(result, SearchResponse)
+    assert len(result.chunks) == 2
+    assert result.chunks[0].score == 0.8
 
 
 @pytest.mark.asyncio
-async def test_trigger_index_returns_job(service: ChatbotService):
+async def test_search_no_results(service, mock_db):
+    mock_db.execute.return_value = MagicMock(mappings=MagicMock(all=lambda: []))
+
+    result = await service.search("nonexistent")
+    assert result.chunks == []
+
+
+# ── trigger_index() ──
+
+@pytest.mark.asyncio
+async def test_trigger_index_returns_202(service, mock_db):
     result = await service.trigger_index()
-    assert result.job_id
     assert result.status == "started"
+    assert result.job_id
 
 
 @pytest.mark.asyncio
-async def test_get_status_returns_shape(service: ChatbotService):
+async def test_trigger_index_article_not_found_raises_404(service, mock_db):
+    mock_db.execute.return_value = MagicMock(scalar=MagicMock(return_value=None))
+
+    with pytest.raises(HTTPException) as exc_info:
+        await service.trigger_index(article_id="nonexistent-uuid")
+    assert exc_info.value.status_code == 404
+
+
+# ── get_status() ──
+
+@pytest.mark.asyncio
+async def test_get_status_returns_shape(service, mock_db):
+    mock_db.execute.return_value = MagicMock(scalar=MagicMock(return_value=42))
+
     result = await service.get_status()
-    assert isinstance(result.total_chunks, int)
-    assert isinstance(result.pending_articles, int)
+    assert result.pending_articles == 42
+    assert result.total_chunks == 0
+    assert result.last_indexed_at is None

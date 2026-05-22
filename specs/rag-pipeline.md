@@ -2,7 +2,41 @@
 
 > Backend-internal design. Frontend developers do not need this document.
 
-## Overview
+## Architecture: Independent Database
+
+chatbot-plugin uses its **own PostgreSQL + pgvector database**, completely independent from scrape-and-analyze's database. Data is synced from scrape-and-analyze via a separate process (Phase 2 indexer).
+
+**Why independent:**
+- No coupling with scrape-and-analyze's DB schema migrations
+- Can add pgvector extension without affecting the main DB
+- Plugin can be deployed/restarted independently
+
+## Phase 1: Full-Text Search Fallback
+
+Before embedding + hybrid search is ready, Phase 1 uses PostgreSQL `tsvector` full-text search:
+
+```
+User Query
+    │
+    ▼
+PostgreSQL plainto_tsquery('english', query)
+    │
+    ▼
+ts_rank() scoring
+    │
+    ▼
+Top-K Articles (whole articles as context)
+    │
+    ▼
+LLM Generate
+```
+
+**Limitations compared to Phase 2:**
+- No semantic search (only keyword matching)
+- No chunking (whole articles as context, less precise)
+- No RRF fusion (single ranking method)
+
+## Overview (Phase 2 Target)
 
 The RAG pipeline retrieves relevant article chunks from PostgreSQL, assembles them as context, and feeds them to an LLM for generation.
 

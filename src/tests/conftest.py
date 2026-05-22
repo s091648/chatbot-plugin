@@ -2,9 +2,24 @@
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from unittest.mock import AsyncMock, patch
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from chatbot_plugin.routers import chat_router
+from chatbot_plugin.service import ChatbotService
 from fastapi import FastAPI
+
+
+@pytest.fixture
+def mock_db() -> AsyncMock:
+    """Mock async DB session."""
+    return AsyncMock(spec=AsyncSession)
+
+
+@pytest.fixture
+def service(mock_db: AsyncMock) -> ChatbotService:
+    """ChatbotService with mocked DB."""
+    return ChatbotService(mock_db)
 
 
 @pytest.fixture

@@ -2,6 +2,14 @@
 
 > How to install and integrate chatbot-plugin into scrape-and-analyze.
 
+## Architecture: Independent Database
+
+chatbot-plugin has its own PostgreSQL + pgvector database. It does **not** share scrape-and-analyze's database. This means:
+
+- No schema coupling with the main app
+- Can add pgvector extension independently
+- Data sync between scrape-and-analyze → chatbot-plugin handled separately (Phase 2)
+
 ## Installation
 
 ```bash
@@ -30,6 +38,9 @@ This exposes all endpoints under `/chat/*`:
 All variables use the `CHATBOT_` prefix. Add to scrape-and-analyze's `.env`:
 
 ```bash
+# Database (independent PG + pgvector)
+CHATBOT_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/chatbot_plugin
+
 # LLM
 CHATBOT_LLM_PROVIDER=claude
 CHATBOT_LLM_MODEL=claude-sonnet-4-6-20250514
@@ -48,10 +59,12 @@ CHATBOT_CHUNK_OVERLAP=50
 
 ## Database
 
-- Shares scrape-and-analyze's PostgreSQL instance
+- **Independent PostgreSQL + pgvector instance** (not shared with scrape-and-analyze)
+- Connection via `CHATBOT_DATABASE_URL` (async driver: `asyncpg`)
 - Plugin adds `article_chunks` table (see `specs/rag-pipeline.md`)
 - Requires `pgvector` extension: `CREATE EXTENSION IF NOT EXISTS vector;`
 - Migration via Alembic (Phase 2)
+- Data sync from scrape-and-analyze handled by indexer (Phase 2)
 
 ## Dependencies
 

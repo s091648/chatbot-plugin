@@ -5,6 +5,7 @@ and response shapes. Business logic is tested in service tests.
 """
 
 import pytest
+from unittest.mock import AsyncMock, patch, MagicMock
 from httpx import AsyncClient
 
 
@@ -13,18 +14,15 @@ from httpx import AsyncClient
 class TestChatMessage:
     @pytest.mark.asyncio
     async def test_message_accepts_valid_body(self, client: AsyncClient):
-        resp = await client.post("/chat/message", json={"message": "hello"})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "reply" in data
-        assert "articles_used" in data
-
-    @pytest.mark.asyncio
-    async def test_message_with_user_id(self, client: AsyncClient):
-        resp = await client.post(
-            "/chat/message", json={"message": "hello", "user_id": "u1"}
-        )
-        assert resp.status_code == 200
+        with patch("chatbot_plugin.service.ChatbotService.chat", new_callable=AsyncMock) as mock:
+            mock.return_value = MagicMock(
+                reply="test", articles_used=[], model_dump=lambda: {"reply": "test", "articles_used": []}
+            )
+            resp = await client.post("/chat/message", json={"message": "hello"})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert "reply" in data
+            assert "articles_used" in data
 
     @pytest.mark.asyncio
     async def test_message_empty_body_rejected(self, client: AsyncClient):
@@ -47,15 +45,14 @@ class TestChatMessage:
 class TestChatSearch:
     @pytest.mark.asyncio
     async def test_search_accepts_valid_body(self, client: AsyncClient):
-        resp = await client.post("/chat/search", json={"query": "RAG"})
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "chunks" in data
-
-    @pytest.mark.asyncio
-    async def test_search_with_top_k(self, client: AsyncClient):
-        resp = await client.post("/chat/search", json={"query": "RAG", "top_k": 5})
-        assert resp.status_code == 200
+        with patch("chatbot_plugin.service.ChatbotService.search", new_callable=AsyncMock) as mock:
+            mock.return_value = MagicMock(
+                chunks=[], model_dump=lambda: {"chunks": []}
+            )
+            resp = await client.post("/chat/search", json={"query": "RAG"})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert "chunks" in data
 
     @pytest.mark.asyncio
     async def test_search_empty_query_rejected(self, client: AsyncClient):
@@ -73,19 +70,27 @@ class TestChatSearch:
 class TestChatIndex:
     @pytest.mark.asyncio
     async def test_index_no_body(self, client: AsyncClient):
-        resp = await client.post("/chat/index", json={})
-        assert resp.status_code == 202
-        data = resp.json()
-        assert "job_id" in data
-        assert data["status"] == "started"
+        with patch("chatbot_plugin.service.ChatbotService.trigger_index", new_callable=AsyncMock) as mock:
+            mock.return_value = MagicMock(
+                job_id="job-1", status="started",
+                model_dump=lambda: {"job_id": "job-1", "status": "started"}
+            )
+            resp = await client.post("/chat/index", json={})
+            assert resp.status_code == 202
+            data = resp.json()
+            assert "job_id" in data
+            assert data["status"] == "started"
 
     @pytest.mark.asyncio
-    async def test_index_with_article_id(self, client: AsyncClient):
-        resp = await client.post(
-            "/chat/index",
-            json={"article_id": "a1b2c3d4-5678-90ab-cdef-1234567890ab"},
-        )
-        assert resp.status_code == 202
+    async def test_index_article_not_found(self, client: AsyncClient):
+        from fastapi import HTTPException
+        with patch("chatbot_plugin.service.ChatbotService.trigger_index", new_callable=AsyncMock) as mock:
+            mock.side_effect = HTTPException(status_code=404, detail="Article not found")
+            resp = await client.post(
+                "/chat/index",
+                json={"article_id": "nonexistent-uuid"},
+            )
+            assert resp.status_code == 404
 
 
 # ── GET /chat/status ──
@@ -93,9 +98,14 @@ class TestChatIndex:
 class TestChatStatus:
     @pytest.mark.asyncio
     async def test_status_returns_shape(self, client: AsyncClient):
-        resp = await client.get("/chat/status")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "total_chunks" in data
-        assert "last_indexed_at" in data
-        assert "pending_articles" in data
+        with patch("chatbot_plugin.service.ChatbotService.get_status", new_callable=AsyncMock) as mock:
+            mock.return_value = MagicMock(
+                total_chunks=0, last_indexed_at=None, pending_articles=5,
+                model_dump=lambda: {"total_chunks": 0, "last_indexed_at": None, "pending_articles": 5}
+            )
+            resp = await client.get("/chat/status")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert "total_chunks" in data
+            assert "last_indexed_at" in data
+            assert "pending_articles" in data

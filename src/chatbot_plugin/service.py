@@ -7,6 +7,7 @@ Spec reference: specs/chat-api.md
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from chatbot_plugin.config import settings
 from chatbot_plugin.contracts import (
     ChatMessageResponse,
     SearchResponse,

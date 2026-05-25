@@ -20,16 +20,21 @@ def service(mock_db) -> ChatbotService:
     return ChatbotService(mock_db)
 
 
+def _mock_result(rows: list[dict] | None = None, scalar_val=None):
+    """Build a mock DB result that supports .mappings().all() and .scalar()."""
+    result = MagicMock()
+    result.mappings.return_value.all.return_value = rows or []
+    result.scalar.return_value = scalar_val
+    return result
+
+
 # ── chat() ──
 
 @pytest.mark.asyncio
 async def test_chat_returns_reply_and_articles(service, mock_db):
-    mock_rows = [
-        {"id": "uuid-1", "title": "RAG Article", "content": "RAG content...", "rank": 0.5},
-    ]
-    mock_db.execute.return_value = MagicMock(mappings=MagicMock(
-        all=lambda: mock_rows
-    ))
+    mock_db.execute.return_value = _mock_result(
+        rows=[{"id": "uuid-1", "title": "RAG Article", "content": "RAG content...", "rank": 0.5}]
+    )
 
     with patch("chatbot_plugin.service.rag_generate", new_callable=AsyncMock) as mock_llm:
         mock_llm.return_value = "RAG is retrieval-augmented generation."
@@ -43,7 +48,7 @@ async def test_chat_returns_reply_and_articles(service, mock_db):
 
 @pytest.mark.asyncio
 async def test_chat_no_articles_still_generates(service, mock_db):
-    mock_db.execute.return_value = MagicMock(mappings=MagicMock(all=lambda: []))
+    mock_db.execute.return_value = _mock_result(rows=[])
 
     with patch("chatbot_plugin.service.rag_generate", new_callable=AsyncMock) as mock_llm:
         mock_llm.return_value = "I don't have specific articles on that."
@@ -54,7 +59,7 @@ async def test_chat_no_articles_still_generates(service, mock_db):
 
 @pytest.mark.asyncio
 async def test_chat_llm_failure_raises_503(service, mock_db):
-    mock_db.execute.return_value = MagicMock(mappings=MagicMock(all=lambda: []))
+    mock_db.execute.return_value = _mock_result(rows=[])
 
     with patch("chatbot_plugin.service.rag_generate", new_callable=AsyncMock) as mock_llm:
         mock_llm.side_effect = Exception("LLM timeout")
@@ -67,11 +72,12 @@ async def test_chat_llm_failure_raises_503(service, mock_db):
 
 @pytest.mark.asyncio
 async def test_search_returns_chunks(service, mock_db):
-    mock_rows = [
-        {"id": "uuid-1", "title": "Article A", "content": "Content A", "rank": 0.8},
-        {"id": "uuid-2", "title": "Article B", "content": "Content B", "rank": 0.5},
-    ]
-    mock_db.execute.return_value = MagicMock(mappings=MagicMock(all=lambda: mock_rows))
+    mock_db.execute.return_value = _mock_result(
+        rows=[
+            {"id": "uuid-1", "title": "Article A", "content": "Content A", "rank": 0.8},
+            {"id": "uuid-2", "title": "Article B", "content": "Content B", "rank": 0.5},
+        ]
+    )
 
     result = await service.search("RAG", top_k=10)
     assert isinstance(result, SearchResponse)
@@ -81,7 +87,7 @@ async def test_search_returns_chunks(service, mock_db):
 
 @pytest.mark.asyncio
 async def test_search_no_results(service, mock_db):
-    mock_db.execute.return_value = MagicMock(mappings=MagicMock(all=lambda: []))
+    mock_db.execute.return_value = _mock_result(rows=[])
 
     result = await service.search("nonexistent")
     assert result.chunks == []
@@ -98,7 +104,7 @@ async def test_trigger_index_returns_202(service, mock_db):
 
 @pytest.mark.asyncio
 async def test_trigger_index_article_not_found_raises_404(service, mock_db):
-    mock_db.execute.return_value = MagicMock(scalar=MagicMock(return_value=None))
+    mock_db.execute.return_value = _mock_result(scalar_val=None)
 
     with pytest.raises(HTTPException) as exc_info:
         await service.trigger_index(article_id="nonexistent-uuid")
@@ -109,7 +115,7 @@ async def test_trigger_index_article_not_found_raises_404(service, mock_db):
 
 @pytest.mark.asyncio
 async def test_get_status_returns_shape(service, mock_db):
-    mock_db.execute.return_value = MagicMock(scalar=MagicMock(return_value=42))
+    mock_db.execute.return_value = _mock_result(scalar_val=42)
 
     result = await service.get_status()
     assert result.pending_articles == 42

@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Chatbot plugin for scrape-and-analyze — pluggable conversational AI over scraped articles"
 requires-python = ">=3.11"
 dependencies = [
-    "scrape-analyzer",
     "fastapi",
     "uvicorn[standard]",
     "pydantic>=2.0",

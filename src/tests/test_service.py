@@ -159,9 +159,9 @@ async def test_trigger_index_article_not_found_raises_404(service, mock_db, mock
 
 @pytest.mark.asyncio
 async def test_trigger_index_already_indexing_raises_409(service, mock_db, mock_llm_service):
-    """Second call with same article_id raises 409."""
-    mock_db.execute.return_value = _mock_result(scalar_val="uuid-1")
-    await service.trigger_index(article_id="uuid-1")
+    """409 when article_id is currently being indexed (in _indexing_articles)."""
+    # Simulate an in-progress indexing by manually adding to the tracking set
+    service._indexing_articles.add("uuid-1")
 
     with pytest.raises(HTTPException) as exc_info:
         await service.trigger_index(article_id="uuid-1")

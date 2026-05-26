@@ -116,7 +116,13 @@ class ChatbotService:
             self._indexing_articles.add(article_id)
 
         # Phase 1: stub response. Phase 2 will implement background indexing.
-        return IndexResponse(job_id=str(uuid.uuid4()))
+        job_id = str(uuid.uuid4())
+
+        # Clean up tracking set (Phase 2 will remove after background task completes)
+        if article_id is not None:
+            self._indexing_articles.discard(article_id)
+
+        return IndexResponse(job_id=job_id)
 
     async def get_status(self) -> StatusResponse:
         """Get indexing status and vector store stats.

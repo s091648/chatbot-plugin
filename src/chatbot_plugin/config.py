@@ -14,7 +14,7 @@ class ChatbotSettings(BaseSettings):
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/chatbot_plugin"
 
     # LLM providers path (defaults to providers.toml in project root)
-    llm_providers_path: str = ""
+    llm_providers_path: str | None = None
 
     # RAG behavior
     max_context_articles: int = 10

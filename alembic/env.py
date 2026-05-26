@@ -1,6 +1,7 @@
 """Alembic environment configuration for async PostgreSQL."""
 
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -12,6 +13,11 @@ from chatbot_plugin.models.article import Base
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# Override sqlalchemy.url from env var if set
+db_url = os.environ.get("CHATBOT_DATABASE_URL")
+if db_url:
+    config.set_main_option("sqlalchemy.url", db_url)
 
 target_metadata = Base.metadata
 

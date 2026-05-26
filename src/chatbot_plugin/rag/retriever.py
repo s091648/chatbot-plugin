@@ -52,4 +52,8 @@ class Retriever:
 
         result = await self.db.execute(sql, params)
         rows = result.mappings().all()
-        return [dict(row) for row in rows]
+        # Normalize ts_rank (unbounded) to 0-1 using rank/(rank+1)
+        return [
+            {**dict(row), "rank": row["rank"] / (row["rank"] + 1) if row["rank"] else 0.0}
+            for row in rows
+        ]

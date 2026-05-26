@@ -36,8 +36,8 @@ async def test_search_returns_correct_shape():
     mock_db = AsyncMock()
     mock_db.execute.return_value = _mock_result(
         rows=[
-            {"id": "uuid-1", "title": "Article A", "content": "Content A", "rank": 0.8},
-            {"id": "uuid-2", "title": "Article B", "content": "Content B", "rank": 0.5},
+            {"id": "uuid-1", "title": "Article A", "content": "Content A", "rank": 4.0},
+            {"id": "uuid-2", "title": "Article B", "content": "Content B", "rank": 1.0},
         ]
     )
 
@@ -46,7 +46,8 @@ async def test_search_returns_correct_shape():
 
     assert len(results) == 2
     assert results[0]["id"] == "uuid-1"
-    assert results[0]["rank"] == 0.8
+    # rank normalized: 4.0 / (4.0 + 1) = 0.8
+    assert results[0]["rank"] == pytest.approx(0.8, abs=0.01)
 
 
 @pytest.mark.asyncio
@@ -95,3 +96,29 @@ async def test_search_uses_plainto_tsquery():
 
     sql_text = str(mock_db.execute.call_args[0][0])
     assert "plainto_tsquery" in sql_text
+
+
+@pytest.mark.asyncio
+async def test_search_normalizes_score_to_0_1():
+    """ts_rank is unbounded; retriever must normalize to 0-1 range."""
+    mock_db = AsyncMock()
+    mock_db.execute.return_value = _mock_result(
+        rows=[{"id": "uuid-1", "title": "A", "content": "C", "rank": 99.0}]
+    )
+
+    retriever = Retriever(mock_db)
+    results = await retriever.search("test")
+    assert 0.0 <= results[0]["rank"] <= 1.0
+    assert results[0]["rank"] == pytest.approx(99.0 / 100.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_search_zero_rank_returns_zero():
+    mock_db = AsyncMock()
+    mock_db.execute.return_value = _mock_result(
+        rows=[{"id": "uuid-1", "title": "A", "content": "C", "rank": 0.0}]
+    )
+
+    retriever = Retriever(mock_db)
+    results = await retriever.search("test")
+    assert results[0]["rank"] == 0.0

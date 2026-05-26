@@ -46,6 +46,9 @@ GEMINI_API_KEY=your-gemini-key
 CLAUDE_API_KEY=your-claude-key
 OPENROUTER_API_KEY=your-openrouter-key
 
+# LLM providers config path (defaults to providers.toml in project root)
+CHATBOT_LLM_PROVIDERS_PATH=
+
 # Behavior
 CHATBOT_MAX_CONTEXT_ARTICLES=10
 CHATBOT_MAX_CONTEXT_TOKENS=8000

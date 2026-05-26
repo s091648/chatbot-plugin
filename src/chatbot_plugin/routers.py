@@ -34,7 +34,8 @@ def init_llm_service() -> None:
     """Initialize the LLM service. Call once at app startup."""
     global _llm_service
     from chatbot_plugin.llm.bootstrap import build_llm_service
-    _llm_service = build_llm_service()
+    from chatbot_plugin.config import settings
+    _llm_service = build_llm_service(path=settings.llm_providers_path)
 
 
 def _service(db: AsyncSession = Depends(get_db)) -> ChatbotService:

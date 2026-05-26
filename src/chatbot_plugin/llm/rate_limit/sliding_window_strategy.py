@@ -3,6 +3,7 @@
 import asyncio
 import time
 from collections import deque
+from datetime import date
 
 from chatbot_plugin.llm.rate_limit.quota_strategy import QuotaStrategy, RateLimitExhausted
 
@@ -12,7 +13,7 @@ class SlidingWindowStrategy(QuotaStrategy):
 
     Uses asyncio.Lock for thread safety in async contexts.
     Two 60-second rolling windows track requests and tokens.
-    A daily counter tracks total requests.
+    A daily counter tracks total requests, resetting at calendar day boundary.
     """
 
     def __init__(self, rpm: int, tpm: int, rpd: int) -> None:
@@ -23,6 +24,7 @@ class SlidingWindowStrategy(QuotaStrategy):
         self._rpm_window: deque[float] = deque()
         self._tpm_window: deque[tuple[float, int]] = deque()
         self._daily_count = 0
+        self._daily_date: date = date.today()
 
     async def acquire(self, estimated_tokens: int = 0) -> None:
         """Wait until a request slot is available.
@@ -49,7 +51,12 @@ class SlidingWindowStrategy(QuotaStrategy):
         async with self._lock:
             now = time.monotonic()
 
-            # Check daily quota
+            # Check daily quota (reset counter if new day)
+            today = date.today()
+            if today != self._daily_date:
+                self._daily_count = 0
+                self._daily_date = today
+
             if self._rpd > 0 and self._daily_count >= self._rpd:
                 raise RateLimitExhausted(
                     f"Daily quota reached: {self._daily_count}/{self._rpd}"

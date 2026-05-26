@@ -79,3 +79,7 @@ class BaseProvider(ABC):
         except Exception as e:
             logger.warning("provider_generate_failed", model=self._model, error=str(e))
             return None
+
+    async def aclose(self) -> None:
+        """Clean up async resources. Override in subclasses that create clients."""
+        pass

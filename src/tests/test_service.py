@@ -56,10 +56,10 @@ async def test_chat_llm_failure_raises_503(service, mock_db, mock_llm_service):
 
 
 @pytest.mark.asyncio
-async def test_chat_generic_exception_raises_503(service, mock_db, mock_llm_service):
-    """Non-RuntimeError exceptions from rag_generate also produce 503."""
+async def test_chat_connection_error_raises_503(service, mock_db, mock_llm_service):
+    """Connection errors from LLM provider produce 503."""
     service.retriever.search = AsyncMock(return_value=[])
-    mock_llm_service.generate.side_effect = Exception("unexpected error")
+    mock_llm_service.generate.side_effect = ConnectionError("connection refused")
 
     with pytest.raises(HTTPException) as exc_info:
         await service.chat("hello")

@@ -4,6 +4,7 @@ import httpx
 import structlog
 
 from chatbot_plugin.llm.base_provider import BaseProvider
+from chatbot_plugin.llm.rate_limit.quota_strategy import RateLimitExhausted
 
 logger = structlog.get_logger()
 
@@ -30,6 +31,8 @@ class OpenRouterProvider(BaseProvider):
                 ],
             },
         )
+        if response.status_code == 429:
+            raise RateLimitExhausted(f"OpenRouter rate limit: HTTP 429")
         response.raise_for_status()
         data = response.json()
 
@@ -43,3 +46,7 @@ class OpenRouterProvider(BaseProvider):
             output_tokens=usage.get("completion_tokens", 0),
         )
         return content
+
+    async def aclose(self) -> None:
+        """Close the httpx async client."""
+        await self._client.aclose()

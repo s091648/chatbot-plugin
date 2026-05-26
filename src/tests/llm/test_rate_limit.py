@@ -100,3 +100,18 @@ class TestSlidingWindowStrategy:
         # TPM is full — compute_wait should return > 0
         wait = await strategy._compute_wait(20)
         assert wait > 0
+
+    @pytest.mark.asyncio
+    async def test_daily_counter_resets_on_new_day(self):
+        """Daily counter resets when the calendar day changes."""
+        from datetime import date
+        strategy = SlidingWindowStrategy(rpm=100, tpm=100000, rpd=2)
+        await strategy.acquire(10)
+        await strategy.acquire(10)
+        # Daily quota exhausted
+        with pytest.raises(RateLimitExhausted):
+            await strategy.acquire(10)
+        # Simulate day change
+        strategy._daily_date = date(2000, 1, 1)
+        # Should succeed again after day resets
+        await strategy.acquire(10)

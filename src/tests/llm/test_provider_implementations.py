@@ -45,6 +45,22 @@ class TestClaudeProvider:
         assert call_kwargs.kwargs["system"] == "system-instr"
         assert call_kwargs.kwargs["messages"] == [{"role": "user", "content": "user-msg"}]
 
+    @pytest.mark.asyncio
+    async def test_call_api_rate_limit_raises(self):
+        with patch("chatbot_plugin.llm.claude_provider.anthropic") as mock_anthropic:
+            import anthropic as real_anthropic
+            mock_client = AsyncMock()
+            mock_anthropic.AsyncAnthropic.return_value = mock_client
+            mock_anthropic.RateLimitError = real_anthropic.RateLimitError
+            from chatbot_plugin.llm.claude_provider import ClaudeProvider
+            provider = ClaudeProvider(api_key="sk-test", model="claude-sonnet-4-6-20250514")
+            mock_client.messages.create.side_effect = real_anthropic.RateLimitError(
+                message="rate limit", response=MagicMock(), body=None
+            )
+
+            with pytest.raises(RateLimitExhausted):
+                await provider._call_api("sys", "human")
+
 
 # ── GeminiProvider ──
 
@@ -84,11 +100,11 @@ class TestGeminiProvider:
         mock_client.models.generate_content.return_value = mock_response
 
         result = await provider._call_api("sys", "human")
-        assert result == ""
+        assert result is None
 
     @pytest.mark.asyncio
     @patch("chatbot_plugin.llm.gemini_provider.genai")
-    async def test_call_api_blocked_finish_reason_returns_empty(self, mock_genai):
+    async def test_call_api_blocked_finish_reason_returns_none(self, mock_genai):
         mock_client = MagicMock()
         mock_genai.Client.return_value = mock_client
         mock_genai.GenerateContentConfig = MagicMock()
@@ -101,7 +117,7 @@ class TestGeminiProvider:
         mock_client.models.generate_content.return_value = mock_response
 
         result = await provider._call_api("sys", "human")
-        assert result == ""
+        assert result is None
 
     @pytest.mark.asyncio
     @patch("chatbot_plugin.llm.gemini_provider.genai")
@@ -208,3 +224,29 @@ class TestOpenRouterProvider:
 
         result = await provider._call_api("sys", "human")
         assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_call_api_429_raises_rate_limit_exhausted(self):
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx") as mock_httpx:
+            mock_client = AsyncMock()
+            mock_httpx.AsyncClient.return_value = mock_client
+            from chatbot_plugin.llm.openrouter_provider import OpenRouterProvider
+            provider = OpenRouterProvider(api_key="sk-test", model="test-model")
+
+            mock_response = MagicMock()
+            mock_response.status_code = 429
+            mock_client.post.return_value = mock_response
+
+            with pytest.raises(RateLimitExhausted):
+                await provider._call_api("sys", "human")
+
+    @pytest.mark.asyncio
+    async def test_aclose_closes_client(self):
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx") as mock_httpx:
+            mock_client = AsyncMock()
+            mock_httpx.AsyncClient.return_value = mock_client
+            from chatbot_plugin.llm.openrouter_provider import OpenRouterProvider
+            provider = OpenRouterProvider(api_key="sk-test", model="test-model")
+
+            await provider.aclose()
+            mock_client.aclose.assert_called_once()

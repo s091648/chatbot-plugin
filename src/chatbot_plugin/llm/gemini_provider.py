@@ -47,7 +47,7 @@ class GeminiProvider(BaseProvider):
         # Check for blocked/safety-filtered responses
         if not response.candidates:
             logger.warning("gemini_no_candidates", model=self._model)
-            return ""
+            return None
 
         candidate = response.candidates[0]
         if hasattr(candidate, "finish_reason") and candidate.finish_reason not in (1, "STOP"):
@@ -56,7 +56,7 @@ class GeminiProvider(BaseProvider):
                 model=self._model,
                 finish_reason=str(candidate.finish_reason),
             )
-            return ""
+            return None
 
         token_counts = {}
         if hasattr(response, "usage_metadata") and response.usage_metadata:
@@ -66,4 +66,4 @@ class GeminiProvider(BaseProvider):
             }
 
         logger.info("gemini_api_called", model=self._model, **token_counts)
-        return response.text or ""
+        return response.text or None

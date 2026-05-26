@@ -37,7 +37,9 @@ def app(mock_llm_service: AsyncMock) -> FastAPI:
     set_llm_service(mock_llm_service)
     app = FastAPI()
     app.include_router(chat_router, prefix="/chat", tags=["chat"])
-    return app
+    yield app
+    # Teardown: reset LLM service to avoid leaking between tests
+    set_llm_service(None)
 
 
 @pytest.fixture

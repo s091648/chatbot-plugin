@@ -55,7 +55,7 @@ class ChatbotService:
             reply = await rag_generate(message, articles, self.llm_service)
         except RuntimeError:
             raise HTTPException(status_code=503, detail="LLM provider unavailable")
-        except Exception as e:
+        except (ConnectionError, TimeoutError) as e:
             raise HTTPException(status_code=503, detail="LLM provider unavailable") from e
 
         # 3. Build response with article references

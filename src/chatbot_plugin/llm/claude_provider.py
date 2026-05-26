@@ -4,6 +4,7 @@ import anthropic
 import structlog
 
 from chatbot_plugin.llm.base_provider import BaseProvider
+from chatbot_plugin.llm.rate_limit.quota_strategy import RateLimitExhausted
 
 logger = structlog.get_logger()
 
@@ -16,12 +17,16 @@ class ClaudeProvider(BaseProvider):
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
 
     async def _call_api(self, system_prompt: str, human_prompt: str) -> str:
-        response = await self._client.messages.create(
-            model=self._model,
-            max_tokens=2048,
-            system=system_prompt,
-            messages=[{"role": "user", "content": human_prompt}],
-        )
+        try:
+            response = await self._client.messages.create(
+                model=self._model,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=[{"role": "user", "content": human_prompt}],
+            )
+        except anthropic.RateLimitError as e:
+            raise RateLimitExhausted(f"Claude rate limit: {e}") from e
+
         logger.info(
             "claude_api_called",
             model=self._model,

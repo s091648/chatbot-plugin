@@ -28,7 +28,7 @@ class ChunkResult(BaseModel):
     content: str = Field(..., description="Chunk text")
     article_id: str = Field(..., description="Parent article UUID")
     article_title: str = Field(..., description="Parent article title")
-    score: float = Field(..., ge=0.0, le=1.0, description="RRF fusion score")
+    score: float = Field(..., ge=0.0, description="Relevance score")
 
 
 class SearchResponse(BaseModel):

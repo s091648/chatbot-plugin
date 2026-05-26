@@ -96,10 +96,11 @@ Chat Response
 
 ### RAG Chain (`rag/chain.py`)
 
-- **Input:** user message + optional user_id
-- **Steps:** retrieve → build prompt → call LLM → parse response
-- **LLM call:** via LangChain, provider determined by `CHATBOT_LLM_PROVIDER`
-- **Output:** reply string + list of articles used
+- **Input:** user message + retrieved articles + `ResilientLLMService`
+- **Steps:** retrieve → build messages (system + human) → call LLM → return reply
+- **LLM call:** via `ResilientLLMService.generate()` with fallback chain
+- **Prompt structure:** Separate `system_prompt` (instructions) and `human_prompt` (context + query)
+- **Output:** reply string
 
 ## Database Schema
 
@@ -162,3 +163,46 @@ CREATE INDEX idx_chunks_dense ON article_chunks
 | `CHATBOT_RRF_K` | `60` | RRF constant k |
 | `CHATBOT_CHUNK_SIZE` | `512` | Max tokens per chunk |
 | `CHATBOT_CHUNK_OVERLAP` | `50` | Overlap tokens between chunks |
+
+## LLM Provider Architecture
+
+Provider configuration is loaded from `providers.toml` (project root). The actual file is gitignored; commit only `providers.example.toml` as a template.
+
+### Provider TOML Format
+
+```toml
+[[providers]]
+name = "gemini"              # Provider type: gemini | claude | openrouter
+priority = 1                  # Lower = tried first
+model = "gemini-2.5-flash"   # Model string
+api_key_env = "GEMINI_API_KEY"  # Name of env var holding the API key
+
+[providers.strategy]
+type = "sliding_window"       # Rate limiting strategy
+rpm = 5                       # Requests per minute
+tpm = 250000                  # Tokens per minute
+rpd = 500                     # Requests per day
+```
+
+### Architecture
+
+```
+providers.toml → load_providers() → build_llm_service()
+                                           |
+                                   ResilientLLMService
+                                      (fallback chain)
+                                    /       |       \
+                            ClaudeProvider  GeminiProvider  OpenRouterProvider
+                                    \       |       /
+                                   BaseProvider (async tenacity retry)
+                                           |
+                                     QuotaStrategy (rate limiting)
+```
+
+### Key Design
+
+- **Native SDKs** (no LangChain): `anthropic.AsyncAnthropic`, `google.genai.Client`, `httpx.AsyncClient`
+- **Async throughout**: `asyncio.Lock`, `asyncio.sleep`, `AsyncRetrying`
+- **Fallback chain**: `ResilientLLMService` tries providers in priority order, falls back on `RateLimitExhausted` or other errors
+- **Env var names** match scrape-and-analyze: `GEMINI_API_KEY`, `CLAUDE_API_KEY`, `OPENROUTER_API_KEY`
+- **`BaseProvider.generate(system_prompt, human_prompt)`**: Single method, returns `str | None`

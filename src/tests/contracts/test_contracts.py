@@ -139,8 +139,7 @@ class TestSearchResponse:
     def test_score_bounds(self):
         ChunkResult(content="t", article_id="u", article_title="T", score=0.0)
         ChunkResult(content="t", article_id="u", article_title="T", score=1.0)
-        with pytest.raises(ValidationError):
-            ChunkResult(content="t", article_id="u", article_title="T", score=1.1)
+        ChunkResult(content="t", article_id="u", article_title="T", score=5.0)  # ts_rank can exceed 1.0
         with pytest.raises(ValidationError):
             ChunkResult(content="t", article_id="u", article_title="T", score=-0.1)
 

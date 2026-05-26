@@ -16,14 +16,16 @@ from chatbot_plugin.contracts import (
     ArticleRef,
     ChunkResult,
 )
+from chatbot_plugin.llm.resilient_llm_service import ResilientLLMService
 from chatbot_plugin.rag.chain import rag_generate
 
 
 class ChatbotService:
     """Handles message processing: context retrieval + LLM response generation."""
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(self, db: AsyncSession, llm_service: ResilientLLMService) -> None:
         self.db = db
+        self.llm_service = llm_service
 
     async def chat(self, message: str, user_id: str | None = None) -> ChatMessageResponse:
         """Process a user message and return a chatbot reply.
@@ -45,7 +47,9 @@ class ChatbotService:
 
         # 2. Generate reply via RAG chain
         try:
-            reply = await rag_generate(message, articles)
+            reply = await rag_generate(message, articles, self.llm_service)
+        except RuntimeError:
+            raise HTTPException(status_code=503, detail="LLM provider unavailable")
         except Exception as e:
             raise HTTPException(status_code=503, detail="LLM provider unavailable") from e
 

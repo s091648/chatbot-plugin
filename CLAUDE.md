@@ -43,12 +43,27 @@ src/chatbot_plugin/
   contracts/                     # Pydantic models = spec in code
     requests.py                  # ChatMessageRequest, SearchRequest, IndexRequest
     responses.py                 # ChatMessageResponse, SearchResponse, etc.
+  llm/                           # LLM provider infrastructure
+    config.py                    # load_providers() — reads providers.toml
+    bootstrap.py                 # build_llm_service() factory
+    base_provider.py             # BaseProvider ABC + async tenacity retry
+    claude_provider.py           # Anthropic AsyncAnthropic
+    gemini_provider.py           # Google genai.Client + asyncio.to_thread
+    openrouter_provider.py       # httpx.AsyncClient
+    resilient_llm_service.py     # ProviderHandler + fallback chain
+    rate_limit/                  # Async rate limiting
+      quota_strategy.py          # ABC
+      sliding_window_strategy.py # asyncio.Lock + deque
+      no_op_strategy.py          # No-op passthrough
   config.py                      # CHATBOT_* env vars
   routers.py                     # FastAPI endpoints
   service.py                     # Business logic
+providers.example.toml           # Provider config template (commit this)
+providers.toml                   # Actual provider config (gitignored)
 src/tests/
   contracts/                     # Contract conformance tests
   routers/                       # API endpoint tests
+  llm/                           # LLM provider tests
   test_service.py                # Unit tests
 ```
 

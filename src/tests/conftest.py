@@ -2,11 +2,12 @@
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from chatbot_plugin.routers import chat_router
+from chatbot_plugin.routers import chat_router, set_llm_service
 from chatbot_plugin.service import ChatbotService
+from chatbot_plugin.llm.resilient_llm_service import ResilientLLMService
 from fastapi import FastAPI
 
 
@@ -17,14 +18,23 @@ def mock_db() -> AsyncMock:
 
 
 @pytest.fixture
-def service(mock_db: AsyncMock) -> ChatbotService:
-    """ChatbotService with mocked DB."""
-    return ChatbotService(mock_db)
+def mock_llm_service() -> AsyncMock:
+    """Mock ResilientLLMService."""
+    service = AsyncMock(spec=ResilientLLMService)
+    service.generate.return_value = "Mocked LLM reply"
+    return service
 
 
 @pytest.fixture
-def app() -> FastAPI:
-    """Create a test FastAPI app with chat routes mounted."""
+def service(mock_db: AsyncMock, mock_llm_service: AsyncMock) -> ChatbotService:
+    """ChatbotService with mocked DB and LLM."""
+    return ChatbotService(mock_db, mock_llm_service)
+
+
+@pytest.fixture
+def app(mock_llm_service: AsyncMock) -> FastAPI:
+    """Create a test FastAPI app with chat routes and mock LLM service."""
+    set_llm_service(mock_llm_service)
     app = FastAPI()
     app.include_router(chat_router, prefix="/chat", tags=["chat"])
     return app

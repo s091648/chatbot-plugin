@@ -13,3 +13,4 @@ htmlcov/
 .claude/
 src/DB_COMPARISON.md
 .pytest_cache/
+providers.toml

@@ -12,9 +12,9 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg",
     "anthropic",
-    "langchain>=0.3",
-    "langchain-anthropic>=0.3",
-    "langchain-google-genai>=2.0",
+    "google-genai",
+    "httpx",
+    "tenacity",
 ]
 
 [dependency-groups]

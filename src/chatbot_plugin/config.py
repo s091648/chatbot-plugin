@@ -1,6 +1,7 @@
 """Configuration for the chatbot plugin.
 
 All settings are read from environment variables with the `CHATBOT_` prefix.
+LLM provider configuration is loaded from providers.toml (see specs/rag-pipeline.md).
 """
 
 from pydantic_settings import BaseSettings
@@ -12,10 +13,8 @@ class ChatbotSettings(BaseSettings):
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/chatbot_plugin"
 
-    # LLM provider
-    llm_provider: str = "claude"  # claude | gemini | openrouter
-    llm_model: str = "claude-sonnet-4-6-20250514"
-    llm_api_key_env: str = "ANTHROPIC_API_KEY"
+    # LLM providers path (defaults to providers.toml in project root)
+    llm_providers_path: str = ""
 
     # RAG behavior
     max_context_articles: int = 10

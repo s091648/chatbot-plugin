@@ -15,9 +15,7 @@ CONTEXT_TEMPLATE = """\
 [source: {title}]
 {content}"""
 
-FULL_PROMPT_TEMPLATE = """\
-{system_prompt}
-
+HUMAN_PROMPT_TEMPLATE = """\
 ## Relevant Articles
 
 {context}
@@ -45,39 +43,48 @@ def build_context(articles: list[dict], max_tokens: int | None = None) -> str:
     total_chars = 0
 
     for article in articles:
-        snippet = CONTEXT_TEMPLATE.format(
-            title=article.get("title", "Untitled"),
-            content=article.get("content", ""),
-        )
-        if total_chars + len(snippet) > max_chars:
-            # Truncate this article's content to fit
-            remaining = max_chars - total_chars - len(CONTEXT_TEMPLATE.format(title=article.get("title", "Untitled"), content=""))
-            if remaining > 100:
-                snippet = CONTEXT_TEMPLATE.format(
-                    title=article.get("title", "Untitled"),
-                    content=article.get("content", "")[:remaining] + "...",
-                )
-                parts.append(snippet)
+        title = article.get("title", "Untitled")
+        content = article.get("content", "")
+
+        # Calculate template overhead (everything except the content)
+        template_overhead = len(CONTEXT_TEMPLATE.format(title=title, content=""))
+        snippet_budget = max_chars - total_chars - template_overhead
+
+        if snippet_budget <= 0:
             break
+
+        if len(content) <= snippet_budget:
+            snippet = CONTEXT_TEMPLATE.format(title=title, content=content)
+        elif snippet_budget - 3 > 100:  # 3 chars for "..."
+            snippet = CONTEXT_TEMPLATE.format(
+                title=title,
+                content=content[:snippet_budget - 3] + "...",
+            )
+        else:
+            break
+
         parts.append(snippet)
         total_chars += len(snippet)
 
     return "\n\n".join(parts)
 
 
-def build_prompt(query: str, articles: list[dict]) -> str:
-    """Build the full RAG prompt from query and articles.
+def build_messages(query: str, articles: list[dict]) -> tuple[str, str]:
+    """Build RAG prompt as (system_prompt, human_prompt) tuple.
+
+    Separating system and human prompts allows LLM providers to use
+    proper system message handling for better instruction following.
 
     Args:
         query: User's question.
         articles: List of dicts with 'title' and 'content' keys.
 
     Returns:
-        Complete prompt string ready for LLM.
+        (system_prompt, human_prompt) tuple.
     """
     context = build_context(articles)
-    return FULL_PROMPT_TEMPLATE.format(
-        system_prompt=SYSTEM_PROMPT,
+    human_prompt = HUMAN_PROMPT_TEMPLATE.format(
         context=context or "No relevant articles found.",
         query=query,
     )
+    return SYSTEM_PROMPT, human_prompt

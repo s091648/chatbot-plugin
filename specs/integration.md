@@ -41,9 +41,10 @@ All variables use the `CHATBOT_` prefix. Add to scrape-and-analyze's `.env`:
 # Database (independent PG + pgvector)
 CHATBOT_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/chatbot_plugin
 
-# LLM
-CHATBOT_LLM_PROVIDER=claude
-CHATBOT_LLM_MODEL=claude-sonnet-4-6-20250514
+# LLM provider keys (names must match providers.toml api_key_env)
+GEMINI_API_KEY=your-gemini-key
+CLAUDE_API_KEY=your-claude-key
+OPENROUTER_API_KEY=your-openrouter-key
 
 # Behavior
 CHATBOT_MAX_CONTEXT_ARTICLES=10
@@ -69,16 +70,15 @@ CHATBOT_CHUNK_OVERLAP=50
 ## Dependencies
 
 chatbot-plugin declares these runtime dependencies:
-- `scrape-analyzer` — shared models and DB access
 - `fastapi` — router mounting
 - `pydantic>=2.0` — settings and contracts
 - `structlog` — structured logging
 - `sqlalchemy` — DB queries
-- `anthropic` — Claude API (default LLM provider)
-
-Phase 2 adds:
-- `langchain`, `langchain-anthropic`, `langchain-google-genai`
-- `sentence-transformers` — BGE-M3 embedding
+- `asyncpg` — async PostgreSQL driver
+- `anthropic` — Claude SDK
+- `google-genai` — Gemini SDK
+- `httpx` — async HTTP client (OpenRouter)
+- `tenacity` — async retry logic
 
 ## Frontend
 

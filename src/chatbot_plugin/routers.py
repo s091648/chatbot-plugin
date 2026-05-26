@@ -21,13 +21,32 @@ from chatbot_plugin.contracts import (
     StatusResponse,
 )
 from chatbot_plugin.db import get_db
+from chatbot_plugin.llm.resilient_llm_service import ResilientLLMService
 from chatbot_plugin.service import ChatbotService
 
 chat_router = APIRouter()
 
+# Module-level LLM service, initialized at app startup
+_llm_service: ResilientLLMService | None = None
+
+
+def init_llm_service() -> None:
+    """Initialize the LLM service. Call once at app startup."""
+    global _llm_service
+    from chatbot_plugin.llm.bootstrap import build_llm_service
+    _llm_service = build_llm_service()
+
 
 def _service(db: AsyncSession = Depends(get_db)) -> ChatbotService:
-    return ChatbotService(db)
+    if _llm_service is None:
+        init_llm_service()
+    return ChatbotService(db, _llm_service)
+
+
+def set_llm_service(service: ResilientLLMService) -> None:
+    """Set the LLM service explicitly. Used for testing."""
+    global _llm_service
+    _llm_service = service
 
 
 @chat_router.post("/message", response_model=ChatMessageResponse)

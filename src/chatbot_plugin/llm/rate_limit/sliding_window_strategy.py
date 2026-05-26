@@ -87,4 +87,7 @@ class SlidingWindowStrategy(QuotaStrategy):
         if current_tokens + estimated_tokens <= self._tpm:
             return 0
         # Wait until the oldest entry exits the window
+        if not self._tpm_window:
+            # Single request exceeds TPM — no window to wait on, proceed anyway
+            return 0
         return self._tpm_window[0][0] + 60.0 - now

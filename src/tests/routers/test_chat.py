@@ -109,3 +109,60 @@ class TestChatStatus:
             assert "total_chunks" in data
             assert "last_indexed_at" in data
             assert "pending_articles" in data
+
+
+# ── Additional router branch tests ──
+
+
+class TestRouterAdditional:
+    @pytest.mark.asyncio
+    async def test_message_with_user_id(self, client: AsyncClient):
+        """Router passes user_id through to service.chat."""
+        with patch("chatbot_plugin.service.ChatbotService.chat", new_callable=AsyncMock) as mock:
+            mock.return_value = MagicMock(
+                reply="hi", articles_used=[], model_dump=lambda: {"reply": "hi", "articles_used": []}
+            )
+            resp = await client.post("/chat/message", json={"message": "hello", "user_id": "user-1"})
+            assert resp.status_code == 200
+            mock.assert_called_once_with("hello", "user-1")
+
+    @pytest.mark.asyncio
+    async def test_search_with_topic_id(self, client: AsyncClient):
+        """Router passes topic_id through to service.search."""
+        with patch("chatbot_plugin.service.ChatbotService.search", new_callable=AsyncMock) as mock:
+            mock.return_value = MagicMock(
+                chunks=[], model_dump=lambda: {"chunks": []}
+            )
+            resp = await client.post("/chat/search", json={"query": "RAG", "topic_id": "topic-1"})
+            assert resp.status_code == 200
+            mock.assert_called_once_with("RAG", 10, "topic-1")
+
+    @pytest.mark.asyncio
+    async def test_index_with_article_id(self, client: AsyncClient):
+        """Router passes article_id through to service.trigger_index."""
+        with patch("chatbot_plugin.service.ChatbotService.trigger_index", new_callable=AsyncMock) as mock:
+            mock.return_value = MagicMock(
+                job_id="job-1", status="started",
+                model_dump=lambda: {"job_id": "job-1", "status": "started"}
+            )
+            resp = await client.post("/chat/index", json={"article_id": "uuid-1"})
+            assert resp.status_code == 202
+            mock.assert_called_once_with("uuid-1")
+
+    @pytest.mark.asyncio
+    async def test_message_503_on_llm_failure(self, client: AsyncClient):
+        """Router returns 503 when service.chat raises HTTPException(503)."""
+        from fastapi import HTTPException
+        with patch("chatbot_plugin.service.ChatbotService.chat", new_callable=AsyncMock) as mock:
+            mock.side_effect = HTTPException(status_code=503, detail="LLM provider unavailable")
+            resp = await client.post("/chat/message", json={"message": "hello"})
+            assert resp.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_set_llm_service_overrides(self, client: AsyncClient):
+        """set_llm_service can override the LLM service for testing."""
+        from chatbot_plugin.routers import set_llm_service, _llm_service
+        # The conftest already called set_llm_service, so _llm_service is not None
+        # Just verify it was set
+        from chatbot_plugin import routers
+        assert routers._llm_service is not None

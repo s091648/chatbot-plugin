@@ -69,3 +69,54 @@ class TestResilientLLMService:
 
         result = await service.generate("sys", "human")
         assert result == "gemini reply"  # priority 1 tried first
+
+    @pytest.mark.asyncio
+    async def test_fallback_on_generic_exception(self):
+        """Non-RateLimitExhausted exceptions also trigger fallback."""
+        h1 = _handler("gemini", 1, generate_side_effect=RuntimeError("boom"))
+        h2 = _handler("claude", 2, generate_return="claude reply")
+        service = ResilientLLMService([h1, h2])
+
+        result = await service.generate("sys", "human")
+        assert result == "claude reply"
+
+    @pytest.mark.asyncio
+    async def test_mixed_failures_then_success(self):
+        """First provider RateLimitExhausted, second returns None, third succeeds."""
+        h1 = _handler("gemini", 1, generate_side_effect=RateLimitExhausted("daily"))
+        h2 = _handler("claude", 2, generate_return=None)
+        h3 = _handler("openrouter", 3, generate_return="or reply")
+        service = ResilientLLMService([h1, h2, h3])
+
+        result = await service.generate("sys", "human")
+        assert result == "or reply"
+
+
+class TestProviderHandler:
+    @pytest.mark.asyncio
+    async def test_generate_acquires_and_records_on_success(self):
+        """ProviderHandler calls strategy.acquire and strategy.record_usage on success."""
+        from chatbot_plugin.llm.resilient_llm_service import ProviderHandler
+        strategy = AsyncMock()
+        provider = AsyncMock()
+        provider.generate.return_value = "success"
+        handler = ProviderHandler(provider=provider, strategy=strategy, priority=1, name="test")
+
+        result = await handler.generate("sys", "human")
+        assert result == "success"
+        strategy.acquire.assert_called_once()
+        strategy.record_usage.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_generate_skips_record_usage_on_none(self):
+        """ProviderHandler does not call record_usage when provider returns None."""
+        from chatbot_plugin.llm.resilient_llm_service import ProviderHandler
+        strategy = AsyncMock()
+        provider = AsyncMock()
+        provider.generate.return_value = None
+        handler = ProviderHandler(provider=provider, strategy=strategy, priority=1, name="test")
+
+        result = await handler.generate("sys", "human")
+        assert result is None
+        strategy.acquire.assert_called_once()
+        strategy.record_usage.assert_not_called()

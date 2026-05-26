@@ -6,8 +6,8 @@ PostgreSQL database. Data is synced from scrape-and-analyze separately.
 
 import uuid
 
-from sqlalchemy import Column, Index, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import Column, Computed, Index, String, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase
 
 
@@ -29,11 +29,20 @@ class Article(Base):
     metadata_ = Column("metadata", JSONB, nullable=True)
     correlation_id = Column(UUID(as_uuid=True), nullable=True)
     topic_id = Column(UUID(as_uuid=True), nullable=True)
+    search_tsv = Column(
+        TSVECTOR,
+        Computed(
+            "to_tsvector('english', coalesce(title,'') || ' ' || coalesce(content,''))",
+            persisted=True,
+        ),
+        nullable=True,
+    )
 
     __table_args__ = (
         Index("idx_articles_source", "source"),
         Index("idx_articles_scraped_at", "scraped_at"),
         Index("idx_articles_topic_id", "topic_id"),
+        Index("idx_articles_tsv", "search_tsv", postgresql_using="gin"),
     )
 
     def __repr__(self) -> str:

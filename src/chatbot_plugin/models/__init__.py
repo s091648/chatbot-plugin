@@ -1,5 +1,6 @@
-"""SQLAlchemy models for chatbot-plugin."""
+"""SQLAlchemy models for the toolbox."""
 
-from chatbot_plugin.models.article import Article
+from chatbot_plugin.models.article import Article, Base
+from chatbot_plugin.models.chunk import ArticleChunk
 
-__all__ = ["Article"]
+__all__ = ["Article", "ArticleChunk", "Base"]

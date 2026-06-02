@@ -1,93 +1,106 @@
 # Integration Specification
 
-> How to install and integrate chatbot-plugin into scrape-and-analyze.
+> How external services interact with the toolbox.
 
-## Architecture: Independent Database
+## Architecture: Standalone Service
 
-chatbot-plugin has its own PostgreSQL + pgvector database. It does **not** share scrape-and-analyze's database. This means:
+The toolbox runs as its own independent service with its own PostgreSQL + pgvector database.
 
-- No schema coupling with the main app
-- Can add pgvector extension independently
-- Data sync between scrape-and-analyze → chatbot-plugin handled separately (Phase 2)
+- Standalone FastAPI server (not embedded in scrape-and-analyze)
+- Owns its own database — no schema coupling with other services
+- External services (e.g. scrape-and-analyze) send chunk + embedding data via HTTP
+- Chat/retrieval APIs will be added in a later phase
 
-## Installation
+## Running the Toolbox
 
 ```bash
-# In scrape-and-analyze root
-uv add chatbot-plugin
+# Start the server
+uvicorn chatbot_plugin.main:app --reload
+
+# Or set the host/port
+CHATBOT_DATABASE_URL=postgresql+asyncpg://... uvicorn chatbot_plugin.main:app --host 0.0.0.0 --port 8000
 ```
 
-## Backend Mounting
+## How External Services Send Data
 
-In `backend/main.py`:
+Scrape-and-analyze (or any service) POSTs to the toolbox:
 
 ```python
-from chatbot_plugin.routers import chat_router
+import httpx
 
-app.include_router(chat_router, prefix="/chat", tags=["chat"])
+async def send_chunks():
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "http://toolbox:8000/tools/chunks",
+            json={
+                "article": {"id": "...", "url": "..."},
+                "chunks": [
+                    {"chunk_index": 0, "content": "...", "dense_vector": [...], "sparse_vector": {...}},
+                ],
+            },
+        )
+        assert resp.status_code == 201
 ```
 
-This exposes all endpoints under `/chat/*`:
-- `POST /chat/message`
-- `POST /chat/search`
-- `POST /chat/index`
-- `GET /chat/status`
+This exposes:
+- `POST /tools/chunks` — store article + chunks
 
 ## Environment Variables
 
-All variables use the `CHATBOT_` prefix. Add to scrape-and-analyze's `.env`:
+All variables use the `CHATBOT_` prefix:
 
 ```bash
 # Database (independent PG + pgvector)
 CHATBOT_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/chatbot_plugin
 
-# LLM provider keys (names must match providers.toml api_key_env)
-GEMINI_API_KEY=your-gemini-key
-CLAUDE_API_KEY=your-claude-key
-OPENROUTER_API_KEY=your-openrouter-key
-
-# LLM providers config path (defaults to providers.toml in project root)
-CHATBOT_LLM_PROVIDERS_PATH=
-
-# Behavior
-CHATBOT_MAX_CONTEXT_ARTICLES=10
-CHATBOT_MAX_CONTEXT_TOKENS=8000
-
-# Embedding (Phase 2+)
+# Embedding model config (must match what scrape-and-analyze uses)
 CHATBOT_EMBEDDING_MODEL=BAAI/bge-m3
 CHATBOT_EMBEDDING_DIMENSION=1024
-CHATBOT_RRF_K=60
-CHATBOT_CHUNK_SIZE=512
-CHATBOT_CHUNK_OVERLAP=50
 ```
 
 ## Database
 
 - **Independent PostgreSQL + pgvector instance** (not shared with scrape-and-analyze)
 - Connection via `CHATBOT_DATABASE_URL` (async driver: `asyncpg`)
-- Plugin adds `article_chunks` table (see `specs/rag-pipeline.md`)
-- Requires `pgvector` extension: `CREATE EXTENSION IF NOT EXISTS vector;`
-- Migration via Alembic (Phase 2)
-- Data sync from scrape-and-analyze handled by indexer (Phase 2)
+- Schema managed by SQLAlchemy models + Alembic
+- Extension required: `CREATE EXTENSION IF NOT EXISTS vector;`
+
+### Tables
+
+```sql
+CREATE TABLE articles (
+    id          UUID PRIMARY KEY,
+    url         VARCHAR NOT NULL UNIQUE,
+    title       VARCHAR,
+    source      VARCHAR,
+    metadata    JSONB,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE article_chunks (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    article_id    UUID NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    chunk_index   INT NOT NULL,
+    content       TEXT NOT NULL,
+    dense_vector  vector(1024),
+    sparse_vector JSONB,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(article_id, chunk_index)
+);
+
+-- HNSW index for dense similarity search
+CREATE INDEX hnsw_chunks_dense ON article_chunks
+    USING hnsw (dense_vector vector_cosine_ops);
+```
 
 ## Dependencies
 
-chatbot-plugin declares these runtime dependencies:
 - `fastapi` — router mounting
 - `pydantic>=2.0` — settings and contracts
 - `structlog` — structured logging
-- `sqlalchemy` — DB queries
+- `sqlalchemy[asyncio]>=2.0` — ORM
 - `asyncpg` — async PostgreSQL driver
-- `anthropic` — Claude SDK
-- `google-genai` — Gemini SDK
-- `httpx` — async HTTP client (OpenRouter)
-- `tenacity` — async retry logic
-
-## Frontend
-
-Add a `/chat` page in the existing Next.js app. API shape is defined in `specs/chat-api.md`.
-
-Key integration points:
-1. **Chat page** — `POST /chat/message`, stream display of `reply`, citation cards from `articles_used`
-2. **Search-only mode** — `POST /chat/search`, display `chunks` with scores
-3. **Index management** — `POST /chat/index` + `GET /chat/status` for admin UI
+- `pgvector` — SQLAlchemy/pgvector integration
+- `httpx` — async HTTP client (if needed for future outbound calls)
+- `alembic` — database migrations

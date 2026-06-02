@@ -1,1 +1,1 @@
-"""Chatbot plugin for scrape-and-analyze."""
+"""Vector storage toolbox for scrape-and-analyze."""

@@ -1,138 +1,98 @@
-"""Chatbot service — core chat logic.
+"""Toolbox service — handles chunk storage.
 
-Orchestrates context retrieval and LLM calls.
-Spec reference: specs/chat-api.md
+Orchestrates article upserts and chunk persistence.
+Spec reference: specs/toolbox-api.md
 """
 
-import uuid
+from uuid import UUID
 
-from sqlalchemy import text
+from fastapi import HTTPException
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from chatbot_plugin.config import settings
 from chatbot_plugin.contracts import (
-    ChatMessageResponse,
-    SearchResponse,
-    IndexResponse,
-    StatusResponse,
-    ArticleRef,
-    ChunkResult,
+    StoreChunksRequest,
+    StoreChunksResponse,
 )
-from chatbot_plugin.llm.resilient_llm_service import ResilientLLMService
-from chatbot_plugin.rag.chain import rag_generate
-from chatbot_plugin.rag.retriever import Retriever
+from chatbot_plugin.models import Article, ArticleChunk
 
 
-class ChatbotService:
-    """Handles message processing: context retrieval + LLM response generation."""
+class ToolboxService:
+    """Handles article metadata storage and chunk persistence."""
 
-    def __init__(self, db: AsyncSession, llm_service: ResilientLLMService) -> None:
+    def __init__(self, db: AsyncSession) -> None:
         self.db = db
-        self.llm_service = llm_service
-        self.retriever = Retriever(db)
-        self._indexing_articles: set[str] = set()
 
-    async def chat(self, message: str, user_id: str | None = None) -> ChatMessageResponse:
-        """Process a user message and return a chatbot reply.
+    async def store_chunks(self, request: StoreChunksRequest) -> StoreChunksResponse:
+        """Upsert an article and store its chunks.
+
+        If the article already exists, its metadata is updated and all
+        existing chunks are replaced.
 
         Args:
-            message: The user's input message.
-            user_id: Optional user identifier for per-user context.
+            request: StoreChunksRequest with article info and chunk data.
 
         Returns:
-            ChatMessageResponse with reply and articles_used.
+            StoreChunksResponse with count of stored chunks.
 
         Raises:
-            HTTPException: 503 if LLM provider is unavailable.
+            HTTPException: 400 if dense_vector dimension does not match settings.
         """
-        from fastapi import HTTPException
+        expected_dim = settings.embedding_dimension
+        for chunk in request.chunks:
+            if len(chunk.dense_vector) != expected_dim:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Dense vector dimension mismatch at chunk_index={chunk.chunk_index}: "
+                        f"expected {expected_dim}, got {len(chunk.dense_vector)}"
+                    ),
+                )
 
-        # 1. Retrieve relevant articles via full-text search
-        articles = await self.retriever.search(message, limit=settings.max_context_articles)
+        article_id = UUID(request.article.id)
 
-        # 2. Generate reply via RAG chain
-        try:
-            reply = await rag_generate(message, articles, self.llm_service)
-        except RuntimeError:
-            raise HTTPException(status_code=503, detail="LLM provider unavailable")
-        except (ConnectionError, TimeoutError) as e:
-            raise HTTPException(status_code=503, detail="LLM provider unavailable") from e
+        # Check for existing article
+        result = await self.db.execute(select(Article).where(Article.id == article_id))
+        existing = result.scalar_one_or_none()
 
-        # 3. Build response with article references
-        articles_used = [
-            ArticleRef(id=str(a["id"]), title=a["title"] or "Untitled")
-            for a in articles
-        ]
-        return ChatMessageResponse(reply=reply, articles_used=articles_used)
+        if existing is not None:
+            # Update metadata
+            existing.url = request.article.url
+            existing.title = request.article.title
+            existing.source = request.article.source
+            existing.metadata_ = request.article.metadata
 
-    async def search(
-        self, query: str, top_k: int = 10, topic_id: str | None = None
-    ) -> SearchResponse:
-        """Pure full-text search without LLM generation.
-
-        Args:
-            query: Search query string.
-            top_k: Number of results to return.
-            topic_id: Optional topic filter.
-
-        Returns:
-            SearchResponse with ranked chunks (Phase 1: whole articles as chunks).
-        """
-        articles = await self.retriever.search(query, limit=top_k, topic_id=topic_id)
-        chunks = [
-            ChunkResult(
-                content=a["content"] or "",
-                article_id=str(a["id"]),
-                article_title=a["title"] or "Untitled",
-                score=a["rank"],
+            # Delete old chunks
+            await self.db.execute(
+                delete(ArticleChunk).where(ArticleChunk.article_id == article_id)
             )
-            for a in articles
-        ]
-        return SearchResponse(chunks=chunks)
-
-    async def trigger_index(self, article_id: str | None = None) -> IndexResponse:
-        """Trigger embedding indexing (Phase 2 implementation).
-
-        Args:
-            article_id: Single article to index, or None for all unindexed.
-
-        Returns:
-            IndexResponse with job_id and status.
-
-        Raises:
-            HTTPException: 404 if article_id not found, 409 if already indexing.
-        """
-        from fastapi import HTTPException
-
-        if article_id is not None:
-            if article_id in self._indexing_articles:
-                raise HTTPException(status_code=409, detail="Indexing already in progress")
-            result = await self.db.execute(
-                text("SELECT id FROM articles WHERE id = :id"),
-                {"id": article_id},
+        else:
+            # Create new article
+            new_article = Article(
+                id=article_id,
+                url=request.article.url,
+                title=request.article.title,
+                source=request.article.source,
+                metadata_=request.article.metadata,
             )
-            if result.scalar() is None:
-                raise HTTPException(status_code=404, detail="Article not found")
-            self._indexing_articles.add(article_id)
+            self.db.add(new_article)
+            await self.db.flush()
 
-        # Phase 1: stub response. Phase 2 will implement background indexing.
-        job_id = str(uuid.uuid4())
+        # Insert new chunks
+        for chunk_data in request.chunks:
+            chunk = ArticleChunk(
+                article_id=article_id,
+                chunk_index=chunk_data.chunk_index,
+                content=chunk_data.content,
+                dense_vector=chunk_data.dense_vector,
+                sparse_vector=chunk_data.sparse_vector,
+            )
+            self.db.add(chunk)
 
-        # Clean up tracking set (Phase 2 will remove after background task completes)
-        if article_id is not None:
-            self._indexing_articles.discard(article_id)
+        await self.db.commit()
 
-        return IndexResponse(job_id=job_id)
-
-    async def get_status(self) -> StatusResponse:
-        """Get indexing status and vector store stats.
-
-        Returns:
-            StatusResponse with total_chunks, last_indexed_at, pending_articles.
-        """
-        # Phase 1: no indexer, no chunks. Return zeros.
-        return StatusResponse(
-            total_chunks=0,
-            last_indexed_at=None,
-            pending_articles=0,
+        return StoreChunksResponse(
+            stored=len(request.chunks),
+            article_id=request.article.id,
         )

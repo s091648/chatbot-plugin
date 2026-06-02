@@ -1,7 +1,7 @@
 [project]
 name = "chatbot-plugin"
 version = "0.1.0"
-description = "Chatbot plugin for scrape-and-analyze — pluggable conversational AI over scraped articles"
+description = "Vector storage toolbox for scrape-and-analyze — chunk storage and retrieval"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi",
@@ -11,11 +11,8 @@ dependencies = [
     "structlog",
     "sqlalchemy[asyncio]>=2.0",
     "asyncpg",
-    "anthropic",
-    "google-genai",
-    "httpx",
-    "tenacity",
     "alembic",
+    "pgvector",
 ]
 
 [dependency-groups]

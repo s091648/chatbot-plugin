@@ -1,31 +1,20 @@
-"""Configuration for the chatbot plugin.
+"""Configuration for the toolbox.
 
 All settings are read from environment variables with the `CHATBOT_` prefix.
-LLM provider configuration is loaded from providers.toml (see specs/rag-pipeline.md).
 """
 
 from pydantic_settings import BaseSettings
 
 
 class ChatbotSettings(BaseSettings):
-    """Chatbot plugin settings."""
+    """Toolbox settings."""
 
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/chatbot_plugin"
 
-    # LLM providers path (defaults to providers.toml in project root)
-    llm_providers_path: str | None = None
-
-    # RAG behavior
-    max_context_articles: int = 10
-    max_context_tokens: int = 8000
-
-    # Embedding (Phase 2+)
+    # Embedding model config (must match what scrape-and-analyze uses)
     embedding_model: str = "BAAI/bge-m3"
     embedding_dimension: int = 1024
-    rrf_k: int = 60
-    chunk_size: int = 512
-    chunk_overlap: int = 50
 
     model_config = {"env_prefix": "CHATBOT_"}
 

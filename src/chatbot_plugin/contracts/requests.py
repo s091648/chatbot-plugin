@@ -1,35 +1,34 @@
-"""Request contracts — mirrors specs/chat-api.md request bodies."""
+"""Request contracts — mirrors specs/toolbox-api.md request bodies."""
 
 from pydantic import BaseModel, Field
 
 
-class ChatMessageRequest(BaseModel):
-    """POST /chat/message request.
+class ArticleInfo(BaseModel):
+    """Article metadata included in a store-chunks request."""
 
-    Spec: specs/chat-api.md — POST /chat/message
-    """
-
-    message: str = Field(..., min_length=1, max_length=2000, description="User input")
-    user_id: str | None = Field(default=None, description="Optional user identifier")
-
-
-class SearchRequest(BaseModel):
-    """POST /chat/search request.
-
-    Spec: specs/chat-api.md — POST /chat/search
-    """
-
-    query: str = Field(..., min_length=1, max_length=500, description="Search query")
-    top_k: int = Field(default=10, ge=1, le=50, description="Number of results")
-    topic_id: str | None = Field(default=None, description="Filter by topic UUID")
+    id: str = Field(..., description="Article UUID (upsert key)")
+    url: str = Field(..., description="Source URL")
+    title: str | None = Field(default=None, description="Article title")
+    source: str | None = Field(default=None, description="Source domain / feed name")
+    metadata: dict | None = Field(default=None, description="Arbitrary JSON metadata")
 
 
-class IndexRequest(BaseModel):
-    """POST /chat/index request.
+class ChunkData(BaseModel):
+    """Single pre-chunked, pre-embedded data fragment."""
 
-    Spec: specs/chat-api.md — POST /chat/index
-    """
-
-    article_id: str | None = Field(
-        default=None, description="Single article UUID, null = index all unindexed"
+    chunk_index: int = Field(..., ge=0, description="Position within article (0-based)")
+    content: str = Field(..., description="Chunk text content")
+    dense_vector: list[float] = Field(..., description="Dense embedding vector")
+    sparse_vector: dict[str, float] | None = Field(
+        default=None, description="Lexical weights as {token_index: weight}"
     )
+
+
+class StoreChunksRequest(BaseModel):
+    """POST /tools/chunks request.
+
+    Spec: specs/toolbox-api.md — POST /tools/chunks
+    """
+
+    article: ArticleInfo = Field(..., description="Article metadata")
+    chunks: list[ChunkData] = Field(..., min_length=1, description="Pre-chunked pre-embedded data fragments")

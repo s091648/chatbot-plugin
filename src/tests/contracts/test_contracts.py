@@ -1,174 +1,133 @@
-"""Contract tests — validate Pydantic models match specs/chat-api.md.
+"""Contract tests — validate Pydantic models match specs/toolbox-api.md.
 
 These tests ensure:
 1. Request models accept valid input and reject invalid input per spec
 2. Response models produce JSON that matches the spec shape
-3. Field constraints (min_length, max_length, ge, le) align with spec
+3. Field constraints (min_length, ge, etc.) align with spec
 """
 
 import pytest
 from pydantic import ValidationError
 
 from chatbot_plugin.contracts.requests import (
-    ChatMessageRequest,
-    SearchRequest,
-    IndexRequest,
+    ArticleInfo,
+    ChunkData,
+    StoreChunksRequest,
 )
 from chatbot_plugin.contracts.responses import (
-    ChatMessageResponse,
-    ArticleRef,
-    SearchResponse,
-    ChunkResult,
-    IndexResponse,
-    StatusResponse,
+    StoreChunksResponse,
 )
 
 
-# ── ChatMessageRequest ──
+# ── ArticleInfo ──
 
-class TestChatMessageRequest:
-    def test_valid_minimal(self):
-        req = ChatMessageRequest(message="hello")
-        assert req.message == "hello"
-        assert req.user_id is None
 
-    def test_valid_with_user_id(self):
-        req = ChatMessageRequest(message="hello", user_id="user-1")
-        assert req.user_id == "user-1"
+class TestArticleInfo:
+    def test_valid(self):
+        info = ArticleInfo(
+            id="a1b2c3d4-5678-90ab-cdef-1234567890ab",
+            url="https://example.com",
+            title="Title",
+            source="example.com",
+            metadata={"author": "Alice"},
+        )
+        assert info.id == "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+        assert info.url == "https://example.com"
 
-    def test_empty_message_rejected(self):
+    def test_optional_fields_default_none(self):
+        info = ArticleInfo(
+            id="a1b2c3d4-5678-90ab-cdef-1234567890ab",
+            url="https://example.com",
+        )
+        assert info.title is None
+        assert info.source is None
+        assert info.metadata is None
+
+    def test_id_required(self):
         with pytest.raises(ValidationError):
-            ChatMessageRequest(message="")
+            ArticleInfo(url="https://example.com")
 
-    def test_message_exceeds_max_length(self):
+    def test_url_required(self):
         with pytest.raises(ValidationError):
-            ChatMessageRequest(message="x" * 2001)
-
-    def test_message_at_max_length(self):
-        req = ChatMessageRequest(message="x" * 2000)
-        assert len(req.message) == 2000
+            ArticleInfo(id="a1b2c3d4-5678-90ab-cdef-1234567890ab")
 
 
-# ── SearchRequest ──
+# ── ChunkData ──
 
-class TestSearchRequest:
-    def test_valid_defaults(self):
-        req = SearchRequest(query="test")
-        assert req.top_k == 10
-        assert req.topic_id is None
 
-    def test_top_k_bounds(self):
-        SearchRequest(query="test", top_k=1)
-        SearchRequest(query="test", top_k=50)
+class TestChunkData:
+    def test_valid(self):
+        chunk = ChunkData(
+            chunk_index=0,
+            content="Hello world",
+            dense_vector=[0.1] * 1024,
+            sparse_vector={"0": 0.5, "1": 0.3},
+        )
+        assert chunk.chunk_index == 0
+        assert chunk.content == "Hello world"
+        assert len(chunk.dense_vector) == 1024
+
+    def test_sparse_vector_optional(self):
+        chunk = ChunkData(
+            chunk_index=0,
+            content="Hello world",
+            dense_vector=[0.1] * 1024,
+        )
+        assert chunk.sparse_vector is None
+
+    def test_chunk_index_negative_rejected(self):
         with pytest.raises(ValidationError):
-            SearchRequest(query="test", top_k=0)
-        with pytest.raises(ValidationError):
-            SearchRequest(query="test", top_k=51)
+            ChunkData(
+                chunk_index=-1,
+                content="text",
+                dense_vector=[0.1] * 1024,
+            )
 
-    def test_empty_query_rejected(self):
-        with pytest.raises(ValidationError):
-            SearchRequest(query="")
-
-    def test_query_exceeds_max_length(self):
-        with pytest.raises(ValidationError):
-            SearchRequest(query="x" * 501)
-
-
-# ── IndexRequest ──
-
-class TestIndexRequest:
-    def test_valid_empty(self):
-        req = IndexRequest()
-        assert req.article_id is None
-
-    def test_valid_with_article_id(self):
-        req = IndexRequest(article_id="a1b2c3d4-5678-90ab-cdef-1234567890ab")
-        assert req.article_id is not None
+    def test_chunk_index_zero_accepted(self):
+        chunk = ChunkData(
+            chunk_index=0,
+            content="text",
+            dense_vector=[0.1] * 1024,
+        )
+        assert chunk.chunk_index == 0
 
 
-# ── ChatMessageResponse ──
+# ── StoreChunksRequest ──
 
-class TestChatMessageResponse:
-    def test_valid_with_articles(self):
-        resp = ChatMessageResponse(
-            reply="Based on articles...",
-            articles_used=[
-                ArticleRef(id="uuid-1", title="Article One"),
-                ArticleRef(id="uuid-2", title="Article Two"),
+
+class TestStoreChunksRequest:
+    def test_valid(self):
+        req = StoreChunksRequest(
+            article=ArticleInfo(id="uuid-1", url="https://example.com"),
+            chunks=[
+                ChunkData(chunk_index=0, content="c1", dense_vector=[0.1] * 1024)
             ],
         )
-        assert len(resp.articles_used) == 2
+        assert req.article.id == "uuid-1"
+        assert len(req.chunks) == 1
 
-    def test_no_articles_empty_list(self):
-        resp = ChatMessageResponse(reply="No relevant articles found.", articles_used=[])
-        assert resp.articles_used == []
-
-    def test_json_matches_spec(self):
-        resp = ChatMessageResponse(
-            reply="test reply",
-            articles_used=[ArticleRef(id="uuid-1", title="T1")],
-        )
-        data = resp.model_dump()
-        assert "reply" in data
-        assert "articles_used" in data
-        assert data["articles_used"][0]["id"] == "uuid-1"
-        assert data["articles_used"][0]["title"] == "T1"
-
-
-# ── SearchResponse ──
-
-class TestSearchResponse:
-    def test_valid_with_chunks(self):
-        resp = SearchResponse(
+    def test_multiple_chunks(self):
+        req = StoreChunksRequest(
+            article=ArticleInfo(id="uuid-1", url="https://example.com"),
             chunks=[
-                ChunkResult(
-                    content="chunk text",
-                    article_id="uuid-1",
-                    article_title="Article One",
-                    score=0.87,
-                )
-            ]
+                ChunkData(chunk_index=0, content="c1", dense_vector=[0.1] * 1024),
+                ChunkData(chunk_index=1, content="c2", dense_vector=[0.2] * 1024),
+            ],
         )
-        assert len(resp.chunks) == 1
-        assert resp.chunks[0].score == 0.87
-
-    def test_no_results_empty_list(self):
-        resp = SearchResponse(chunks=[])
-        assert resp.chunks == []
-
-    def test_score_bounds(self):
-        ChunkResult(content="t", article_id="u", article_title="T", score=0.0)
-        ChunkResult(content="t", article_id="u", article_title="T", score=1.0)
-        with pytest.raises(ValidationError):
-            ChunkResult(content="t", article_id="u", article_title="T", score=1.1)
-        with pytest.raises(ValidationError):
-            ChunkResult(content="t", article_id="u", article_title="T", score=-0.1)
+        assert len(req.chunks) == 2
+        assert req.chunks[1].chunk_index == 1
 
 
-# ── IndexResponse ──
+# ── StoreChunksResponse ──
 
-class TestIndexResponse:
+
+class TestStoreChunksResponse:
     def test_valid(self):
-        resp = IndexResponse(job_id="job-uuid-1")
-        assert resp.status == "started"
+        resp = StoreChunksResponse(stored=5, article_id="uuid-1")
+        assert resp.stored == 5
+        assert resp.article_id == "uuid-1"
 
     def test_json_matches_spec(self):
-        resp = IndexResponse(job_id="job-uuid-1")
+        resp = StoreChunksResponse(stored=3, article_id="uuid-1")
         data = resp.model_dump()
-        assert data == {"job_id": "job-uuid-1", "status": "started"}
-
-
-# ── StatusResponse ──
-
-class TestStatusResponse:
-    def test_valid_never_indexed(self):
-        resp = StatusResponse(total_chunks=0, last_indexed_at=None, pending_articles=5)
-        assert resp.last_indexed_at is None
-
-    def test_valid_with_timestamp(self):
-        resp = StatusResponse(
-            total_chunks=1523,
-            last_indexed_at="2026-05-20T10:00:00Z",
-            pending_articles=5,
-        )
-        assert resp.total_chunks == 1523
+        assert data == {"stored": 3, "article_id": "uuid-1"}

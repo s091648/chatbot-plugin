@@ -1,4 +1,4 @@
-"""Async database session for chatbot-plugin's independent PostgreSQL."""
+"""Async database session for the toolbox's independent PostgreSQL."""
 
 from collections.abc import AsyncGenerator
 
@@ -6,7 +6,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from chatbot_plugin.config import settings
-from chatbot_plugin.models.article import Base
+from chatbot_plugin.models import Base
 
 engine = create_async_engine(settings.database_url, echo=False)
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

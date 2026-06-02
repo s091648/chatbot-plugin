@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Pluggable RAG-enabled chatbot for scrape-and-analyze. Two-person team: one frontend, one backend.
+Vector storage toolbox — standalone service that receives pre-chunked, pre-embedded article data from external services and stores it in PostgreSQL + pgvector. Will also serve chat/retrieval APIs for frontend UI. Two-person team: one frontend, one backend.
 
 ## SDD (Spec-Driven Development) Workflow
 
@@ -12,11 +12,11 @@ Pluggable RAG-enabled chatbot for scrape-and-analyze. Two-person team: one front
 
 1. **Spec-first**: Before writing or changing any code, read and update `specs/` first
 2. **Spec files**:
-   - `specs/chat-api.md` — API contract (frontend + backend shared)
-   - `specs/rag-pipeline.md` — RAG internals (backend only)
-   - `specs/integration.md` — How to mount into scrape-and-analyze
+   - `specs/toolbox-api.md` — API contract (shared with external services)
+   - `specs/rag-pipeline.md` — Storage internals (backend only)
+   - `specs/integration.md` — How external services integrate with the toolbox
 3. **Contracts = spec in code**: `src/chatbot_plugin/contracts/` contains Pydantic models that mirror the spec. If spec changes, update contracts first
-4. **API changes must start from spec**: Change `specs/chat-api.md` → update `contracts/` → update router/service → tests pass
+4. **API changes must start from spec**: Change `specs/toolbox-api.md` → update `contracts/` → update router/service → tests pass
 5. **Notify the other person**: If you change an API shape, the other developer needs to know. Spec is the communication channel
 6. **Contract tests must pass**: `src/tests/contracts/` verifies Pydantic models match spec. These are non-negotiable
 
@@ -29,9 +29,9 @@ Pluggable RAG-enabled chatbot for scrape-and-analyze. Two-person team: one front
 4. Implement routers/ + service/ (make tests green)
 ```
 
-### Frontend-Backend Boundary
+### Scrape-and-Analyze Boundary
 
-- Frontend only needs `specs/chat-api.md` — do not look at backend implementation
+- External services only need `specs/toolbox-api.md` — do not look at backend implementation
 - Backend can change internals freely as long as API shape (spec) is unchanged
 - Disputes are resolved by reading the spec, not the code
 
@@ -39,35 +39,30 @@ Pluggable RAG-enabled chatbot for scrape-and-analyze. Two-person team: one front
 
 ```
 specs/                           # SDD spec files (source of truth)
+  toolbox-api.md                 # API contract (POST /chunks)
+  rag-pipeline.md                # Storage internals (backend only)
+  integration.md                 # How external services integrate
 src/chatbot_plugin/
   contracts/                     # Pydantic models = spec in code
-    requests.py                  # ChatMessageRequest, SearchRequest, IndexRequest
-    responses.py                 # ChatMessageResponse, SearchResponse, etc.
-  llm/                           # LLM provider infrastructure
-    config.py                    # load_providers() — reads providers.toml
-    bootstrap.py                 # build_llm_service() factory
-    base_provider.py             # BaseProvider ABC + async tenacity retry
-    claude_provider.py           # Anthropic AsyncAnthropic
-    gemini_provider.py           # Google genai.Client + asyncio.to_thread
-    openrouter_provider.py       # httpx.AsyncClient
-    resilient_llm_service.py     # ProviderHandler + fallback chain
-    rate_limit/                  # Async rate limiting
-      quota_strategy.py          # ABC
-      sliding_window_strategy.py # asyncio.Lock + deque
-      no_op_strategy.py          # No-op passthrough
+    requests.py                  # ArticleInfo, ChunkData, StoreChunksRequest
+    responses.py                 # StoreChunksResponse
+  models/                        # SQLAlchemy ORM models
+    article.py                   # Article + DeclarativeBase
+    chunk.py                     # ArticleChunk (pgvector Vector column)
   config.py                      # CHATBOT_* env vars
+  db.py                          # Async engine + session factory
+  main.py                        # Standalone FastAPI app + lifespan
   routers.py                     # FastAPI endpoints
-  service.py                     # Business logic
-providers.example.toml           # Provider config template (commit this)
-providers.toml                   # Actual provider config (gitignored)
+  service.py                     # Business logic (ToolboxService)
 src/tests/
   contracts/                     # Contract conformance tests
   routers/                       # API endpoint tests
-  llm/                           # LLM provider tests
   test_service.py                # Unit tests
+alembic/                         # Database migrations
 ```
 
 ## Commands
 
+- **Run server:** `uvicorn chatbot_plugin.main:app --reload`
 - **Test:** `uv run pytest src/tests/ -v`
 - **Coverage:** `uv run pytest src/tests/ --cov=chatbot_plugin --cov-report=html`

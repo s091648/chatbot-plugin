@@ -1,189 +1,145 @@
-"""Tests for ChatbotService."""
+"""Tests for ToolboxService."""
 
 import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 from fastapi import HTTPException
+from pydantic import ValidationError
 
-from chatbot_plugin.service import ChatbotService
-from chatbot_plugin.contracts import ChatMessageResponse, SearchResponse
+from chatbot_plugin.config import settings
+from chatbot_plugin.contracts import (
+    ArticleInfo,
+    ChunkData,
+    StoreChunksRequest,
+    StoreChunksResponse,
+)
+from chatbot_plugin.models import Article, ArticleChunk
+from chatbot_plugin.service import ToolboxService
 
 
-def _mock_result(rows: list[dict] | None = None, scalar_val=None):
-    """Build a mock DB result that supports .mappings().all() and .scalar()."""
+@pytest.fixture
+def mock_db() -> AsyncMock:
+    """Mock async DB session."""
+    db = AsyncMock()
+    db.add = MagicMock()  # not async in SQLAlchemy
+    return db
+
+
+@pytest.fixture
+def service(mock_db: AsyncMock) -> ToolboxService:
+    """ToolboxService with mocked DB."""
+    return ToolboxService(mock_db)
+
+
+# ── store_chunks ──
+
+
+@pytest.mark.asyncio
+async def test_store_chunks_creates_new_article(service: ToolboxService, mock_db: AsyncMock):
+    """When article doesn't exist, a new one is created."""
+    # simulate no existing article
     result = MagicMock()
-    result.mappings.return_value.all.return_value = rows or []
-    result.scalar.return_value = scalar_val
-    return result
+    result.scalar_one_or_none.return_value = None
+    mock_db.execute.return_value = result
 
+    req = StoreChunksRequest(
+        article=ArticleInfo(id=str(uuid.uuid4()), url="https://example.com", title="T"),
+        chunks=[ChunkData(chunk_index=0, content="hello", dense_vector=[0.1] * 1024)],
+    )
 
-# ── chat() ──
+    resp = await service.store_chunks(req)
 
-@pytest.mark.asyncio
-async def test_chat_returns_reply_and_articles(service, mock_db, mock_llm_service):
-    service.retriever.search = AsyncMock(return_value=[
-        {"id": "uuid-1", "title": "RAG Article", "content": "RAG content...", "rank": 0.5}
-    ])
-    mock_llm_service.generate.return_value = "RAG is retrieval-augmented generation."
-
-    result = await service.chat("What is RAG?")
-
-    assert isinstance(result, ChatMessageResponse)
-    assert "RAG" in result.reply
-    assert len(result.articles_used) == 1
-    assert result.articles_used[0].title == "RAG Article"
+    assert isinstance(resp, StoreChunksResponse)
+    assert resp.stored == 1
+    assert resp.article_id == req.article.id
+    mock_db.add.assert_called()
+    mock_db.commit.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_chat_no_articles_still_generates(service, mock_db, mock_llm_service):
-    service.retriever.search = AsyncMock(return_value=[])
-    mock_llm_service.generate.return_value = "I don't have specific articles on that."
+async def test_store_chunks_updates_existing_article(service: ToolboxService, mock_db: AsyncMock):
+    """When article exists, metadata is updated and old chunks deleted."""
+    existing = MagicMock(spec=Article)
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = existing
+    mock_db.execute.return_value = result
 
-    result = await service.chat("obscure topic")
+    req = StoreChunksRequest(
+        article=ArticleInfo(id=str(uuid.uuid4()), url="https://example.com", title="New Title"),
+        chunks=[ChunkData(chunk_index=0, content="hello", dense_vector=[0.1] * 1024)],
+    )
 
-    assert result.articles_used == []
+    resp = await service.store_chunks(req)
+
+    assert isinstance(resp, StoreChunksResponse)
+    assert resp.stored == 1
+    assert existing.url == "https://example.com"
+    assert existing.title == "New Title"
+    # Should have executed delete statement plus the select
+    assert mock_db.execute.call_count >= 1
+    mock_db.commit.assert_called_once()
+
+
+def test_store_chunks_rejects_empty_chunks():
+    """Empty chunks list is rejected at the contract layer by Pydantic min_length=1."""
+    with pytest.raises(ValidationError):
+        StoreChunksRequest(
+            article=ArticleInfo(id=str(uuid.uuid4()), url="https://example.com"),
+            chunks=[],
+        )
 
 
 @pytest.mark.asyncio
-async def test_chat_llm_failure_raises_503(service, mock_db, mock_llm_service):
-    service.retriever.search = AsyncMock(return_value=[])
-    mock_llm_service.generate.return_value = None  # All providers failed
+async def test_store_chunks_rejects_wrong_vector_dimension(service: ToolboxService):
+    req = StoreChunksRequest(
+        article=ArticleInfo(id=str(uuid.uuid4()), url="https://example.com"),
+        chunks=[ChunkData(chunk_index=0, content="hello", dense_vector=[0.1] * 512)],
+    )
 
     with pytest.raises(HTTPException) as exc_info:
-        await service.chat("hello")
-    assert exc_info.value.status_code == 503
+        await service.store_chunks(req)
+    assert exc_info.value.status_code == 400
+    assert "mismatch" in exc_info.value.detail.lower()
+    assert str(settings.embedding_dimension) in exc_info.value.detail
 
 
 @pytest.mark.asyncio
-async def test_chat_connection_error_raises_503(service, mock_db, mock_llm_service):
-    """Connection errors from LLM provider produce 503."""
-    service.retriever.search = AsyncMock(return_value=[])
-    mock_llm_service.generate.side_effect = ConnectionError("connection refused")
+async def test_store_chunks_accepts_sparse_vector(service: ToolboxService, mock_db: AsyncMock):
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    mock_db.execute.return_value = result
 
-    with pytest.raises(HTTPException) as exc_info:
-        await service.chat("hello")
-    assert exc_info.value.status_code == 503
+    req = StoreChunksRequest(
+        article=ArticleInfo(id=str(uuid.uuid4()), url="https://example.com"),
+        chunks=[
+            ChunkData(
+                chunk_index=0,
+                content="hello",
+                dense_vector=[0.1] * 1024,
+                sparse_vector={"0": 0.5, "1": 0.3},
+            )
+        ],
+    )
 
-
-@pytest.mark.asyncio
-async def test_chat_untitled_fallback_for_none_title(service, mock_db, mock_llm_service):
-    """Articles with None/empty title get 'Untitled' fallback."""
-    service.retriever.search = AsyncMock(return_value=[
-        {"id": "uuid-1", "title": None, "content": "Some content", "rank": 0.5}
-    ])
-    mock_llm_service.generate.return_value = "Reply"
-
-    result = await service.chat("hello")
-    assert result.articles_used[0].title == "Untitled"
-
-
-# ── search() ──
-
-@pytest.mark.asyncio
-async def test_search_returns_chunks(service, mock_db, mock_llm_service):
-    service.retriever.search = AsyncMock(return_value=[
-        {"id": "uuid-1", "title": "Article A", "content": "Content A", "rank": 0.8},
-        {"id": "uuid-2", "title": "Article B", "content": "Content B", "rank": 0.5},
-    ])
-
-    result = await service.search("RAG", top_k=10)
-    assert isinstance(result, SearchResponse)
-    assert len(result.chunks) == 2
-    assert result.chunks[0].score == 0.8
+    resp = await service.store_chunks(req)
+    assert resp.stored == 1
 
 
 @pytest.mark.asyncio
-async def test_search_no_results(service, mock_db, mock_llm_service):
-    service.retriever.search = AsyncMock(return_value=[])
+async def test_store_chunks_multiple_chunks(service: ToolboxService, mock_db: AsyncMock):
+    result = MagicMock()
+    result.scalar_one_or_none.return_value = None
+    mock_db.execute.return_value = result
 
-    result = await service.search("nonexistent")
-    assert result.chunks == []
+    req = StoreChunksRequest(
+        article=ArticleInfo(id=str(uuid.uuid4()), url="https://example.com"),
+        chunks=[
+            ChunkData(chunk_index=0, content="chunk 0", dense_vector=[0.1] * 1024),
+            ChunkData(chunk_index=1, content="chunk 1", dense_vector=[0.2] * 1024),
+        ],
+    )
 
-
-@pytest.mark.asyncio
-async def test_search_with_topic_id(service, mock_db, mock_llm_service):
-    service.retriever.search = AsyncMock(return_value=[
-        {"id": "uuid-1", "title": "Article A", "content": "Content A", "rank": 0.8}
-    ])
-
-    result = await service.search("RAG", topic_id="topic-uuid")
-    assert len(result.chunks) == 1
-    service.retriever.search.assert_called_once_with("RAG", limit=10, topic_id="topic-uuid")
-
-
-@pytest.mark.asyncio
-async def test_search_untitled_fallback(service, mock_db, mock_llm_service):
-    service.retriever.search = AsyncMock(return_value=[
-        {"id": "uuid-1", "title": "", "content": "Content", "rank": 0.5}
-    ])
-
-    result = await service.search("test")
-    assert result.chunks[0].article_title == "Untitled"
-
-
-@pytest.mark.asyncio
-async def test_search_empty_content_fallback(service, mock_db, mock_llm_service):
-    service.retriever.search = AsyncMock(return_value=[
-        {"id": "uuid-1", "title": "Title", "content": None, "rank": 0.5}
-    ])
-
-    result = await service.search("test")
-    assert result.chunks[0].content == ""
-
-
-# ── trigger_index() ──
-
-@pytest.mark.asyncio
-async def test_trigger_index_returns_202(service, mock_db, mock_llm_service):
-    result = await service.trigger_index()
-    assert result.status == "started"
-    assert result.job_id
-
-
-@pytest.mark.asyncio
-async def test_trigger_index_job_id_is_uuid(service, mock_db, mock_llm_service):
-    """job_id must be a valid UUID per spec."""
-    result = await service.trigger_index()
-    uuid.UUID(result.job_id)  # raises ValueError if not a valid UUID
-
-
-@pytest.mark.asyncio
-async def test_trigger_index_article_not_found_raises_404(service, mock_db, mock_llm_service):
-    mock_db.execute.return_value = _mock_result(scalar_val=None)
-
-    with pytest.raises(HTTPException) as exc_info:
-        await service.trigger_index(article_id="nonexistent-uuid")
-    assert exc_info.value.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_trigger_index_already_indexing_raises_409(service, mock_db, mock_llm_service):
-    """409 when article_id is currently being indexed (in _indexing_articles)."""
-    # Simulate an in-progress indexing by manually adding to the tracking set
-    service._indexing_articles.add("uuid-1")
-
-    with pytest.raises(HTTPException) as exc_info:
-        await service.trigger_index(article_id="uuid-1")
-    assert exc_info.value.status_code == 409
-    assert "already in progress" in exc_info.value.detail.lower()
-
-
-@pytest.mark.asyncio
-async def test_trigger_index_with_article_found(service, mock_db, mock_llm_service):
-    """trigger_index with article_id where the article exists."""
-    mock_db.execute.return_value = _mock_result(scalar_val="uuid-1")
-
-    result = await service.trigger_index(article_id="uuid-1")
-    assert result.status == "started"
-    uuid.UUID(result.job_id)  # valid UUID
-
-
-# ── get_status() ──
-
-@pytest.mark.asyncio
-async def test_get_status_returns_shape(service, mock_db, mock_llm_service):
-    result = await service.get_status()
-    assert result.pending_articles == 0
-    assert result.total_chunks == 0
-    assert result.last_indexed_at is None
+    resp = await service.store_chunks(req)
+    assert resp.stored == 2
+    assert mock_db.add.call_count == 3  # 1 article + 2 chunks

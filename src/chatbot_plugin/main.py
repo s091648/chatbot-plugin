@@ -20,13 +20,17 @@ from chatbot_plugin.routers import toolbox_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # Warm-up embedding model (lazy singleton — loads once and caches)
+    from chatbot_plugin.embedding import _get_model
+
+    _get_model()
     yield
 
 
 app = FastAPI(
     title="Toolbox",
     description="Vector storage toolbox — receives pre-chunked, pre-embedded data and serves retrieval APIs.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 

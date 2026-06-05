@@ -13,9 +13,15 @@ from chatbot_plugin.contracts.requests import (
     ArticleInfo,
     ChunkData,
     StoreChunksRequest,
+    SearchRequest,
+    ChatRequest,
 )
 from chatbot_plugin.contracts.responses import (
     StoreChunksResponse,
+    ChunkResult,
+    SearchResponse,
+    ArticleCitation,
+    ChatResponse,
 )
 
 
@@ -131,3 +137,169 @@ class TestStoreChunksResponse:
         resp = StoreChunksResponse(stored=3, article_id="uuid-1")
         data = resp.model_dump()
         assert data == {"stored": 3, "article_id": "uuid-1"}
+
+
+# ── SearchRequest ──
+
+
+class TestSearchRequest:
+    def test_valid_with_defaults(self):
+        req = SearchRequest(query="What is RAG?")
+        assert req.query == "What is RAG?"
+        assert req.top_k == 10
+
+    def test_valid_with_top_k(self):
+        req = SearchRequest(query="test", top_k=50)
+        assert req.top_k == 50
+
+    def test_empty_query_rejected(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(query="")
+
+    def test_top_k_below_min_rejected(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(query="test", top_k=0)
+
+    def test_top_k_above_max_rejected(self):
+        with pytest.raises(ValidationError):
+            SearchRequest(query="test", top_k=101)
+
+
+# ── ChatRequest ──
+
+
+class TestChatRequest:
+    def test_valid(self):
+        req = ChatRequest(message="Explain RAG")
+        assert req.message == "Explain RAG"
+
+    def test_empty_message_rejected(self):
+        with pytest.raises(ValidationError):
+            ChatRequest(message="")
+
+
+# ── ChunkResult ──
+
+
+class TestChunkResult:
+    def test_valid(self):
+        chunk = ChunkResult(
+            chunk_id="uuid-c1",
+            article_id="uuid-a1",
+            article_title="Title",
+            article_url="https://example.com",
+            chunk_index=0,
+            content="Hello",
+            score=0.876,
+        )
+        assert chunk.chunk_id == "uuid-c1"
+        assert chunk.score == 0.876
+
+    def test_optional_fields_default_none(self):
+        chunk = ChunkResult(
+            chunk_id="uuid-c1",
+            article_id="uuid-a1",
+            chunk_index=0,
+            content="Hello",
+            score=0.5,
+        )
+        assert chunk.article_title is None
+        assert chunk.article_url is None
+
+    def test_json_matches_spec(self):
+        chunk = ChunkResult(
+            chunk_id="uuid-c1",
+            article_id="uuid-a1",
+            article_title="Title",
+            article_url="https://example.com",
+            chunk_index=0,
+            content="Hello",
+            score=0.876,
+        )
+        data = chunk.model_dump()
+        assert data == {
+            "chunk_id": "uuid-c1",
+            "article_id": "uuid-a1",
+            "article_title": "Title",
+            "article_url": "https://example.com",
+            "chunk_index": 0,
+            "content": "Hello",
+            "score": 0.876,
+        }
+
+
+# ── SearchResponse ──
+
+
+class TestSearchResponse:
+    def test_valid(self):
+        resp = SearchResponse(
+            chunks=[
+                ChunkResult(
+                    chunk_id="c1",
+                    article_id="a1",
+                    chunk_index=0,
+                    content="Hello",
+                    score=0.9,
+                )
+            ]
+        )
+        assert len(resp.chunks) == 1
+        assert resp.chunks[0].score == 0.9
+
+    def test_empty_chunks(self):
+        resp = SearchResponse()
+        assert resp.chunks == []
+
+    def test_json_matches_spec(self):
+        resp = SearchResponse(chunks=[])
+        data = resp.model_dump()
+        assert data == {"chunks": []}
+
+
+# ── ArticleCitation ──
+
+
+class TestArticleCitation:
+    def test_valid(self):
+        cite = ArticleCitation(id="uuid-1", title="Title", url="https://example.com")
+        assert cite.id == "uuid-1"
+        assert cite.title == "Title"
+
+    def test_optional_fields_default_none(self):
+        cite = ArticleCitation(id="uuid-1")
+        assert cite.title is None
+        assert cite.url is None
+
+
+# ── ChatResponse ──
+
+
+class TestChatResponse:
+    def test_valid(self):
+        resp = ChatResponse(
+            reply="RAG is...",
+            articles_used=[ArticleCitation(id="a1", title="T")],
+            chunks=[
+                ChunkResult(
+                    chunk_id="c1", article_id="a1", chunk_index=0, content="X", score=0.5
+                )
+            ],
+        )
+        assert resp.reply == "RAG is..."
+        assert len(resp.articles_used) == 1
+        assert len(resp.chunks) == 1
+
+    def test_empty_defaults(self):
+        resp = ChatResponse(reply="No context")
+        assert resp.articles_used == []
+        assert resp.chunks == []
+
+    def test_json_matches_spec(self):
+        resp = ChatResponse(reply="Answer")
+        data = resp.model_dump()
+        assert data == {
+            "reply": "Answer",
+            "articles_used": [],
+            "chunks": [],
+        }

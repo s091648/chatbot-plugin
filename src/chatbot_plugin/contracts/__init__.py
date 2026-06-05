@@ -5,12 +5,24 @@ They must stay in sync with specs/toolbox-api.md. If the spec changes,
 update the corresponding model here first.
 """
 
-from chatbot_plugin.contracts.requests import ArticleInfo, ChunkData, StoreChunksRequest
-from chatbot_plugin.contracts.responses import StoreChunksResponse
+from chatbot_plugin.contracts.requests import ArticleInfo, ChunkData, StoreChunksRequest, SearchRequest, ChatRequest
+from chatbot_plugin.contracts.responses import (
+    StoreChunksResponse,
+    SearchResponse,
+    ChatResponse,
+    ChunkResult,
+    ArticleCitation,
+)
 
 __all__ = [
     "ArticleInfo",
+    "ArticleCitation",
     "ChunkData",
+    "ChunkResult",
     "StoreChunksRequest",
     "StoreChunksResponse",
+    "SearchRequest",
+    "SearchResponse",
+    "ChatRequest",
+    "ChatResponse",
 ]

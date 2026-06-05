@@ -32,3 +32,22 @@ class StoreChunksRequest(BaseModel):
 
     article: ArticleInfo = Field(..., description="Article metadata")
     chunks: list[ChunkData] = Field(..., min_length=1, description="Pre-chunked pre-embedded data fragments")
+
+
+class SearchRequest(BaseModel):
+    """POST /tools/search request.
+
+    Spec: specs/toolbox-api.md — POST /tools/search
+    """
+
+    query: str = Field(..., min_length=1, description="Raw query text")
+    top_k: int = Field(default=10, ge=1, le=100, description="Number of top chunks to return")
+
+
+class ChatRequest(BaseModel):
+    """POST /tools/chat request.
+
+    Spec: specs/toolbox-api.md — POST /tools/chat
+    """
+
+    message: str = Field(..., min_length=1, description="User message")

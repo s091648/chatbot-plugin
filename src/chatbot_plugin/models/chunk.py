@@ -1,14 +1,15 @@
 """Chunk model — stores pre-chunked, pre-embedded article data.
 
 Each chunk belongs to an Article and holds a dense vector (pgvector)
-and optional sparse vector (JSONB lexical weights).
+and optional sparse vector (sparsevec lexical weights).
 """
 
-from sqlalchemy import Column, ForeignKey, Integer, Text, DateTime, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import Column, ForeignKey, Integer, Text, DateTime, UniqueConstraint, func, Index
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
 from pgvector.sqlalchemy import Vector
+from pgvector.sqlalchemy.sparsevec import SPARSEVEC
 
 from chatbot_plugin.config import settings
 from chatbot_plugin.models.article import Base
@@ -29,7 +30,10 @@ class ArticleChunk(Base):
         Vector(settings.embedding_dimension),
         nullable=True,
     )
-    sparse_vector = Column(JSONB, nullable=True)
+    sparse_vector = Column(
+        SPARSEVEC(settings.sparse_dimension),
+        nullable=True,
+    )
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -41,6 +45,7 @@ class ArticleChunk(Base):
 
     __table_args__ = (
         UniqueConstraint("article_id", "chunk_index", name="uq_article_chunk_idx"),
+        Index("idx_chunks_sparse", "sparse_vector"),
     )
 
     def __repr__(self) -> str:

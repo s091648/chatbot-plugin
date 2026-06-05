@@ -21,7 +21,7 @@ uvicorn chatbot_plugin.main:app --reload
 CHATBOT_DATABASE_URL=postgresql+asyncpg://... uvicorn chatbot_plugin.main:app --host 0.0.0.0 --port 8000
 ```
 
-## How External Services Send Data
+## How External Services Send Data, Search, and Chat
 
 Scrape-and-analyze (or any service) POSTs to the toolbox:
 
@@ -42,8 +42,32 @@ async def send_chunks():
         assert resp.status_code == 201
 ```
 
+```python
+async def search():
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "http://toolbox:8000/tools/search",
+            json={"query": "What is RAG?", "top_k": 10},
+        )
+        assert resp.status_code == 200
+        print(resp.json()["chunks"])
+```
+
+```python
+async def chat():
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "http://toolbox:8000/tools/chat",
+            json={"message": "Explain RAG in simple terms"},
+        )
+        assert resp.status_code == 200
+        print(resp.json()["reply"])
+```
+
 This exposes:
 - `POST /tools/chunks` — store article + chunks
+- `POST /tools/search` — hybrid dense + sparse search
+- `POST /tools/chat` — chat with RAG context
 
 ## Environment Variables
 
@@ -56,6 +80,14 @@ CHATBOT_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/chatb
 # Embedding model config (must match what scrape-and-analyze uses)
 CHATBOT_EMBEDDING_MODEL=BAAI/bge-m3
 CHATBOT_EMBEDDING_DIMENSION=1024
+CHATBOT_SPARSE_DIMENSION=250002
+CHATBOT_RRF_K=60
+CHATBOT_SEARCH_CANDIDATES=50
+CHATBOT_MAX_CONTEXT_CHUNKS=10
+
+# LLM config (optional — only needed for /tools/chat)
+CHATBOT_LLM_API_KEY=sk-ant-...
+CHATBOT_LLM_MODEL=claude-sonnet-4-6-20250514
 ```
 
 ## Database
@@ -84,7 +116,7 @@ CREATE TABLE article_chunks (
     chunk_index   INT NOT NULL,
     content       TEXT NOT NULL,
     dense_vector  vector(1024),
-    sparse_vector JSONB,
+    sparse_vector sparsevec(250002),
     created_at    TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(article_id, chunk_index)
 );

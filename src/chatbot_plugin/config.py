@@ -26,6 +26,10 @@ class ChatbotSettings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "claude-sonnet-4-6-20250514"
 
+    # Gemini (fallback if Anthropic is unavailable)
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
+
     model_config = {"env_prefix": "CHATBOT_"}
 
 

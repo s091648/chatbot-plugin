@@ -162,7 +162,10 @@ Chat Response (Claude API via HTTP)
    [source: Another Title]
    Another chunk...
    ```
-4. Send to Claude API:
+4. Send to LLM (fallback chain):
+   1. **Anthropic Claude** — if `CHATBOT_LLM_API_KEY` is set. On any error, fall through.
+   2. **Google Gemini** — if `CHATBOT_GEMINI_API_KEY` is set. On any error (rate limit, unreachable, etc.), fall through.
+   3. **Raw context fallback** — if all LLM calls fail or no key is configured, return the assembled context + question directly so the caller can still inspect retrieved sources.
    - System: "You are a helpful research assistant..."
    - User: context + "\n\nQuestion: {message}"
 5. Return: `{reply, articles_used, chunks}`
@@ -187,6 +190,8 @@ Chat Response (Claude API via HTTP)
 | `CHATBOT_MAX_CONTEXT_CHUNKS` | `10` | Max chunks to include in chat context |
 | `CHATBOT_LLM_API_KEY` | `""` | Anthropic API key (optional) |
 | `CHATBOT_LLM_MODEL` | `"claude-sonnet-4-6-20250514"` | Claude model name |
+| `CHATBOT_GEMINI_API_KEY` | `""` | Google Gemini API key (fallback) |
+| `CHATBOT_GEMINI_MODEL` | `"gemini-2.0-flash"` | Gemini model name |
 
 ## New Dependencies
 

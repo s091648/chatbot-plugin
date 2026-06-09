@@ -240,23 +240,7 @@ class ToolboxService:
         )
 
     async def _call_llm(self, context: str, question: str) -> str:
-        """Call Anthropic Claude API with RAG context."""
-        if not settings.llm_api_key:
-            raise HTTPException(
-                status_code=503,
-                detail="LLM API key not configured. Set CHATBOT_LLM_API_KEY.",
-            )
-
-        try:
-            import anthropic
-        except ImportError as e:
-            raise HTTPException(
-                status_code=500,
-                detail="Anthropic SDK not installed.",
-            ) from e
-
-        client = anthropic.AsyncAnthropic(api_key=settings.llm_api_key)
-
+        """Call LLM for chat. Tries Anthropic first, falls back to Gemini."""
         system = (
             "You are a helpful research assistant. Answer the user's question "
             "using only the provided context. Cite sources using the [source: Title] "
@@ -265,17 +249,64 @@ class ToolboxService:
         )
         user_prompt = f"{context}\n\nQuestion: {question}"
 
-        try:
-            response = await client.messages.create(
-                model=settings.llm_model,
-                max_tokens=2048,
-                system=system,
-                messages=[{"role": "user", "content": user_prompt}],
-            )
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"LLM call failed: {e}",
-            ) from e
+        # Try Anthropic first
+        if settings.llm_api_key:
+            try:
+                import anthropic
+                client = anthropic.AsyncAnthropic(api_key=settings.llm_api_key)
+                response = await client.messages.create(
+                    model=settings.llm_model,
+                    max_tokens=2048,
+                    system=system,
+                    messages=[{"role": "user", "content": user_prompt}],
+                )
+                return response.content[0].text
+            except Exception:
+                pass  # Fallback to Gemini
 
-        return response.content[0].text
+        # Fallback to Gemini, or return raw context if no LLM keys configured
+        if settings.gemini_api_key:
+            try:
+                return await self._call_gemini(system, user_prompt)
+            except Exception:
+                pass  # Gemini failed (unreachable, rate limited, etc.)
+
+        return (
+            "[No LLM configured — returning raw retrieved context]\n\n"
+            f"{user_prompt}\n\n"
+            "[Set CHATBOT_LLM_API_KEY (Anthropic) or CHATBOT_GEMINI_API_KEY "
+            "to enable LLM-generated responses.]"
+        )
+
+    async def _call_gemini(self, system: str, prompt: str) -> str:
+        """Call Google Gemini REST API."""
+        import httpx
+
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{settings.gemini_model}:generateContent"
+        )
+        params = {"key": settings.gemini_api_key}
+        payload = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": prompt}]}
+            ],
+            "generationConfig": {"maxOutputTokens": 2048},
+        }
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(url, params=params, json=payload)
+            if resp.status_code != 200:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Gemini API error: {resp.status_code} {resp.text}",
+                )
+            data = resp.json()
+            try:
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except (KeyError, IndexError) as e:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unexpected Gemini response: {data}",
+                ) from e

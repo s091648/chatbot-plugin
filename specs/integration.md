@@ -86,7 +86,7 @@ CHATBOT_SEARCH_CANDIDATES=50
 CHATBOT_MAX_CONTEXT_CHUNKS=10
 
 # LLM config (optional — only needed for /tools/chat)
-CHATBOT_LLM_API_KEY=sk-ant-...
+CHATBOT_LLM_API_KEY=sk-ant-api-...
 CHATBOT_LLM_MODEL=claude-sonnet-4-6-20250514
 ```
 

@@ -273,6 +273,31 @@ async def test_chat_returns_reply(mock_embed, mock_llm, service, mock_db, make_s
 
 
 @pytest.mark.asyncio
+@patch.object(settings, "llm_api_key", "")
+@patch.object(settings, "gemini_api_key", "")
+@patch("chatbot_plugin.embedding.embed_query")
+async def test_chat_no_llm_key_returns_raw_context(mock_embed, service, mock_db, make_search_row):
+    """When no LLM key is configured, chat returns raw context + question."""
+    mock_embed.return_value = ([0.1] * 1024, {1: 0.5})
+
+    row_a = make_search_row("chunk-a", "art-1", 0, "RAG is retrieval...", "RAG Article", "https://rag.com")
+    dense_result = MagicMock()
+    dense_result.all.return_value = [row_a]
+    sparse_result = MagicMock()
+    sparse_result.all.return_value = []
+
+    mock_db.execute.side_effect = [dense_result, sparse_result]
+
+    req = ChatRequest(message="What is RAG?")
+    resp = await service.chat(req)
+
+    assert "[No LLM configured" in resp.reply
+    assert "Question: What is RAG?" in resp.reply
+    assert len(resp.articles_used) == 1
+    assert len(resp.chunks) == 1
+
+
+@pytest.mark.asyncio
 @patch("chatbot_plugin.embedding.embed_query")
 async def test_chat_no_results(mock_embed, service, mock_db):
     """When search returns no chunks, chat responds with a fallback message."""

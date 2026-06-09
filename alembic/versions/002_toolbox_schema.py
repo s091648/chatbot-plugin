@@ -41,6 +41,9 @@ def upgrade() -> None:
     op.create_index("idx_articles_url", "articles", ["url"])
     op.create_unique_constraint("articles_url_key", "articles", ["url"])
 
+    # pgvector: enable extension
+    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
     # Create article_chunks table
     op.create_table(
         "article_chunks",
@@ -49,24 +52,32 @@ def upgrade() -> None:
         sa.Column("chunk_index", sa.Integer(), nullable=False),
         sa.Column("content", sa.Text(), nullable=False),
         sa.Column("dense_vector", sa.Text(), nullable=True),
-        sa.Column("sparse_vector", JSONB, nullable=True),
+        sa.Column("sparse_vector", sa.Text(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
     )
 
-    # pgvector: enable extension + cast dense_vector to proper vector type
-    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    # Cast dense_vector to proper vector type
     op.execute("ALTER TABLE article_chunks ALTER COLUMN dense_vector TYPE vector(1024) USING dense_vector::vector")
+    # Cast sparse_vector to proper sparsevec type
+    op.execute("ALTER TABLE article_chunks ALTER COLUMN sparse_vector TYPE sparsevec(250002) USING sparse_vector::sparsevec")
 
     op.create_unique_constraint("uq_article_chunk_idx", "article_chunks", ["article_id", "chunk_index"])
     op.create_index("idx_chunks_article_id", "article_chunks", ["article_id"])
 
-    # HNSW index for dense similarity search (required by spec)
+    # HNSW index for dense similarity search
     op.execute(
         "CREATE INDEX hnsw_chunks_dense ON article_chunks USING hnsw (dense_vector vector_cosine_ops)"
+    )
+    # Simple index for sparse vector (sparsevec HNSW not available in pgvector 0.8.0)
+    op.execute(
+        "CREATE INDEX idx_chunks_sparse ON article_chunks (sparse_vector)"
     )
 
 
 def downgrade() -> None:
+    op.execute("DROP INDEX IF EXISTS idx_chunks_sparse")
+    op.execute("DROP INDEX IF EXISTS hnsw_chunks_dense")
+
     op.drop_table("article_chunks")
     op.drop_table("articles")
 

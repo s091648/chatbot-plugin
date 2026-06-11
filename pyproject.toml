@@ -1,16 +1,18 @@
 [project]
 name = "chatbot-plugin"
-version = "0.1.0"
-description = "Vector storage toolbox for scrape-and-analyze — chunk storage and retrieval"
+version = "0.3.0"
+description = "OpenAI-compatible RAG chat backend"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi",
     "uvicorn[standard]",
     "pydantic>=2.0",
+    "chatbot-plugin-sdk",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx",           # ASGITransport + AsyncClient for tests
     "pytest",
     "pytest-cov",
     "pytest-asyncio",

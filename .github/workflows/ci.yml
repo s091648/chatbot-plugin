@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, main, feat/*]
   pull_request:
-    branches: [master]
+    branches: [master, main, feat/*]
 
 permissions:
   contents: read
@@ -17,23 +17,34 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      # ── Checkout backend ──
       - uses: actions/checkout@v4
+        with:
+          path: chatbot-plugin
+
+      # ── Checkout SDK (sibling directory so ../chatbot-plugin-sdk resolves) ──
+      - uses: actions/checkout@v4
+        with:
+          repository: Teng91/chatbot-plugin-sdk
+          path: chatbot-plugin-sdk
 
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        working-directory: ./chatbot-plugin
         run: uv sync --all-groups
 
       - name: Run tests
+        working-directory: ./chatbot-plugin
         run: uv run pytest src/tests/ -v --tb=short --cov=chatbot_plugin --cov-report=xml:coverage.xml --junitxml=pytest.xml
 
       - name: Post coverage comment
         if: github.event_name == 'pull_request'
         uses: MishaKav/pytest-coverage-comment@v1.6.0
         with:
-          pytest-xml-coverage-path: ./coverage.xml
-          junitxml-path: ./pytest.xml
+          pytest-xml-coverage-path: ./chatbot-plugin/coverage.xml
+          junitxml-path: ./chatbot-plugin/pytest.xml
           title: Test Coverage
           github-token: ${{ secrets.GITHUB_TOKEN }}

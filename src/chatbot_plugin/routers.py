@@ -1,27 +1,50 @@
-"""FastAPI router for the toolbox.
+"""FastAPI router — single OpenAI-compatible /v1/chat/completions endpoint."""
 
-Mounted under /tools in the standalone server (main.py).
-External services POST chunk + embedding data here.
-"""
+from __future__ import annotations
 
-from fastapi import APIRouter, Depends
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import APIRouter, HTTPException, Request
 
-from chatbot_plugin.contracts import (
-    StoreChunksRequest,
-    StoreChunksResponse,
+from chatbot_plugin.contracts.chat_completion import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionChoice,
+    ChatCompletionChoiceMessage,
 )
-from chatbot_plugin.db import get_db
-from chatbot_plugin.service import ToolboxService
+from chatbot_plugin_sdk import RagQueryProcessor
 
-toolbox_router = APIRouter()
+api_router = APIRouter(prefix="/v1")
 
 
-@toolbox_router.post("/chunks", status_code=201, response_model=StoreChunksResponse)
-async def store_chunks(
-    req: StoreChunksRequest,
-    db: AsyncSession = Depends(get_db),
-) -> StoreChunksResponse:
-    """Store or update an article and its pre-chunked pre-embedded data."""
-    service = ToolboxService(db)
-    return await service.store_chunks(req)
+def _get_processor(request: Request) -> RagQueryProcessor:
+    processor: RagQueryProcessor | None = \
+        getattr(request.app.state, "processor", None)
+    if processor is None:
+        raise HTTPException(status_code=500, detail="RagQueryProcessor not initialised")
+    return processor
+
+
+@api_router.post("/chat/completions", response_model=ChatCompletionResponse)
+async def chat_completions(
+    req: ChatCompletionRequest,
+    request: Request,
+) -> ChatCompletionResponse:
+    """OpenAI-compatible chat completions with RAG context."""
+    processor = _get_processor(request)
+
+    last_message = req.get_last_user_message()
+    if not last_message.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="messages must contain at least one user message with non-empty content",
+        )
+
+    result = await processor.chat(last_message)
+
+    return ChatCompletionResponse(
+        model="rag-default",
+        choices=[
+            ChatCompletionChoice(
+                message=ChatCompletionChoiceMessage(content=result.reply),
+            )
+        ],
+    )

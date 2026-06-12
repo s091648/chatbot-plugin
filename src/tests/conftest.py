@@ -5,11 +5,15 @@ from httpx import ASGITransport, AsyncClient
 from fastapi import FastAPI
 
 from chatbot_plugin.main import app as toolbox_app
+from chatbot_plugin_sdk import RagQueryProcessor
 
 
 @pytest.fixture
 def app() -> FastAPI:
-    """Return the toolbox FastAPI app."""
+    """Return the toolbox FastAPI app with a mock processor attached."""
+    processor = RagQueryProcessor()
+    processor.configure(dbname="test_db", user="test", password="test")
+    toolbox_app.state.processor = processor
     return toolbox_app
 
 

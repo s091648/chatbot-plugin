@@ -17,7 +17,7 @@ MESSAGES = [
 
 class TestClaudeProvider:
     def test_satisfies_protocol(self):
-        provider = ClaudeProvider.__new__(ClaudeProvider)
+        provider = ClaudeProvider(api_key="test-key")
         assert isinstance(provider, LLMProvider)
 
     @pytest.mark.asyncio
@@ -26,7 +26,7 @@ class TestClaudeProvider:
         mock_response = MagicMock()
         mock_response.content = [MagicMock(text="RAG is retrieval-augmented generation.")]
         mock_response.usage = MagicMock(input_tokens=50, output_tokens=20)
-        with patch.object(provider._client.messages, "create", return_value=mock_response) as mock_create:
+        with patch.object(provider._client.messages, "create", new_callable=AsyncMock, return_value=mock_response) as mock_create:
             result = await provider.complete(MESSAGES, 1024)
         assert result == "RAG is retrieval-augmented generation."
         mock_create.assert_called_once()
@@ -41,13 +41,13 @@ class TestClaudeProvider:
         mock_response = MagicMock()
         mock_response.content = [MagicMock(text="ok")]
         mock_response.usage = MagicMock(input_tokens=0, output_tokens=0)
-        with patch.object(provider._client.messages, "create", return_value=mock_response):
+        with patch.object(provider._client.messages, "create", new_callable=AsyncMock, return_value=mock_response):
             await provider.complete(MESSAGES, 100)
 
 
 class TestGeminiProvider:
     def test_satisfies_protocol(self):
-        provider = GeminiProvider.__new__(GeminiProvider)
+        provider = GeminiProvider(api_key="test-key")
         assert isinstance(provider, LLMProvider)
 
     @pytest.mark.asyncio
@@ -55,7 +55,9 @@ class TestGeminiProvider:
         provider = GeminiProvider(api_key="test-key", model="gemini-2.0-flash")
         mock_response = MagicMock()
         mock_response.text = "RAG is a retrieval technique."
-        mock_response.candidates = [MagicMock(finish_reason=MagicMock(name="STOP"))]
+        finish_reason = MagicMock()
+        finish_reason.name = "STOP"
+        mock_response.candidates = [MagicMock(finish_reason=finish_reason)]
         with patch.object(provider._client.models, "generate_content", return_value=mock_response) as mock_gen:
             result = await provider.complete(MESSAGES, 1024)
         assert result == "RAG is a retrieval technique."
@@ -65,7 +67,9 @@ class TestGeminiProvider:
     async def test_complete_returns_empty_on_blocked(self):
         provider = GeminiProvider(api_key="test-key", model="gemini-2.0-flash")
         mock_response = MagicMock()
-        mock_response.candidates = [MagicMock(finish_reason=MagicMock(name="SAFETY"))]
+        finish_reason = MagicMock()
+        finish_reason.name = "SAFETY"
+        mock_response.candidates = [MagicMock(finish_reason=finish_reason)]
         mock_response.text = ""
         with patch.object(provider._client.models, "generate_content", return_value=mock_response):
             result = await provider.complete(MESSAGES, 1024)
@@ -83,7 +87,7 @@ class TestGeminiProvider:
 
 class TestOpenRouterProvider:
     def test_satisfies_protocol(self):
-        provider = OpenRouterProvider.__new__(OpenRouterProvider)
+        provider = OpenRouterProvider(api_key="test-key", model="test-model")
         assert isinstance(provider, LLMProvider)
 
     @pytest.mark.asyncio

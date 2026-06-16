@@ -54,8 +54,8 @@ class GeminiProvider:
         fr = candidate.finish_reason
         fr_name = fr.name if hasattr(fr, "name") else str(fr)
         if fr_name not in ("STOP", "1"):
-            logger.warning("gemini_blocked", model=self.model, finish_reason=fr_name)
+            logger.warning("gemini_blocked", extra={"model": self.model, "finish_reason": fr_name})
             return ""
 
-        logger.info("gemini_api_called", model=self.model)
+        logger.info("gemini_api_called", extra={"model": self.model})
         return (response.text or "").strip()

@@ -65,14 +65,14 @@ class ResilientLLMService:
                 result = await handler.complete(messages, max_tokens)
                 if result is not None:
                     return result
-                logger.warning("provider_returned_none", provider=handler.name)
+                logger.warning("provider_returned_none", extra={"provider": handler.name})
             except RateLimitExhausted:
-                logger.warning("provider_daily_limit_reached", provider=handler.name)
+                logger.warning("provider_daily_limit_reached", extra={"provider": handler.name})
                 self._handlers.remove(handler)
                 self._handlers.append(handler)
-                logger.warning("provider_moved_to_end", provider=handler.name)
+                logger.warning("provider_moved_to_end", extra={"provider": handler.name})
             except Exception as e:
-                logger.error("provider_failed", provider=handler.name, error=str(e))
+                logger.error("provider_failed", extra={"provider": handler.name, "error": str(e)})
 
         logger.error("all_providers_exhausted")
         return None

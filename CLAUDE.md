@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Vector storage toolbox — standalone service that receives pre-chunked, pre-embedded article data from external services and stores it in PostgreSQL + pgvector. Will also serve chat/retrieval APIs for frontend UI. Two-person team: one frontend, one backend.
+OpenAI-compatible RAG chat backend. Receives user prompts, retrieves relevant chunks from PostgreSQL + pgvector via SDK's RetrieveProcessor, assembles context, and generates replies via a resilient LLM fallback chain (Claude → Gemini → OpenRouter).
 
 ## SDD (Spec-Driven Development) Workflow
 
@@ -12,13 +12,11 @@ Vector storage toolbox — standalone service that receives pre-chunked, pre-emb
 
 1. **Spec-first**: Before writing or changing any code, read and update `specs/` first
 2. **Spec files**:
-   - `specs/toolbox-api.md` — API contract (shared with external services)
-   - `specs/rag-pipeline.md` — Storage internals (backend only)
-   - `specs/integration.md` — How external services integrate with the toolbox
-3. **Contracts = spec in code**: `src/chatbot_plugin/contracts/` contains Pydantic models that mirror the spec. If spec changes, update contracts first
-4. **API changes must start from spec**: Change `specs/toolbox-api.md` → update `contracts/` → update router/service → tests pass
-5. **Notify the other person**: If you change an API shape, the other developer needs to know. Spec is the communication channel
-6. **Contract tests must pass**: `src/tests/contracts/` verifies Pydantic models match spec. These are non-negotiable
+   - `specs/toolbox-api.md` — API contract
+   - `specs/rag-pipeline.md` — Retrieval and generation internals
+   - `specs/integration.md` — How external services integrate
+3. **Contracts = spec in code**: `src/chatbot_plugin/contracts/` contains Pydantic models that mirror the spec
+4. **API changes must start from spec**: Change spec → update contracts → update router/service → tests pass
 
 ### Development Order
 
@@ -29,35 +27,28 @@ Vector storage toolbox — standalone service that receives pre-chunked, pre-emb
 4. Implement routers/ + service/ (make tests green)
 ```
 
-### Scrape-and-Analyze Boundary
-
-- External services only need `specs/toolbox-api.md` — do not look at backend implementation
-- Backend can change internals freely as long as API shape (spec) is unchanged
-- Disputes are resolved by reading the spec, not the code
-
 ## Project Structure
 
 ```
 specs/                           # SDD spec files (source of truth)
-  toolbox-api.md                 # API contract (POST /chunks)
-  rag-pipeline.md                # Storage internals (backend only)
+  toolbox-api.md                 # API contract (POST /v1/chat/completions)
+  rag-pipeline.md                # Retrieval and generation internals
   integration.md                 # How external services integrate
 src/chatbot_plugin/
   contracts/                     # Pydantic models = spec in code
-    requests.py                  # ArticleInfo, ChunkData, StoreChunksRequest
-    responses.py                 # StoreChunksResponse
-  models/                        # SQLAlchemy ORM models
-    article.py                   # Article + DeclarativeBase
-    chunk.py                     # ArticleChunk (pgvector Vector column)
-  config.py                      # CHATBOT_* env vars
-  db.py                          # Async engine + session factory
-  main.py                        # Standalone FastAPI app + lifespan
-  routers.py                     # FastAPI endpoints
-  service.py                     # Business logic (ToolboxService)
+    chat_completion.py           # OpenAI-compatible request/response models
+  llm/                           # LLM provider layer
+    base.py                      # LLMProvider protocol, ResilientLLMService
+    claude_provider.py           # Anthropic Claude
+    gemini_provider.py           # Google Gemini
+    openrouter_provider.py       # OpenRouter
+  chat_service.py                # Core: retrieve → gate → assemble → generate
+  main.py                        # FastAPI app + lifespan
+  routers.py                     # POST /v1/chat/completions endpoint
 src/tests/
-  contracts/                     # Contract conformance tests
+  llm/                           # LLM provider tests
   routers/                       # API endpoint tests
-  test_service.py                # Unit tests
+  test_chat_service.py           # ChatService unit tests
 alembic/                         # Database migrations
 ```
 
@@ -66,3 +57,21 @@ alembic/                         # Database migrations
 - **Run server:** `uvicorn chatbot_plugin.main:app --reload`
 - **Test:** `uv run pytest src/tests/ -v`
 - **Coverage:** `uv run pytest src/tests/ --cov=chatbot_plugin --cov-report=html`
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHATBOT_DATABASE_URL` | `postgresql+asyncpg://postgres:postgres@localhost:5432/chatbot_plugin` | Database URL |
+| `CHATBOT_EMBEDDING_MODEL_API` | `""` | Embedding service URL |
+| `CHATBOT_ENABLE_RERANKER` | `""` | Set to "true" to enable cross-encoder reranking |
+| `CHATBOT_RETRIEVAL_MIN_SCORE` | `0.0` | Pre-rerank score threshold |
+| `CHATBOT_RERANKER_MIN_SCORE` | `0.7` | Post-rerank score threshold |
+| `CHATBOT_MAX_CONTEXT_CHUNKS` | `10` | Max chunks in context |
+| `CHATBOT_MAX_TOKENS` | `2048` | Max LLM output tokens |
+| `CHATBOT_CLAUDE_API_KEY` | `""` | Anthropic API key |
+| `CHATBOT_CLAUDE_MODEL` | `claude-sonnet-4-6-20250514` | Claude model |
+| `CHATBOT_GEMINI_API_KEY` | `""` | Google Gemini API key |
+| `CHATBOT_GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model |
+| `CHATBOT_OPENROUTER_API_KEY` | `""` | OpenRouter API key |
+| `CHATBOT_OPENROUTER_MODEL` | `meta-llama/llama-3-70b` | OpenRouter model |

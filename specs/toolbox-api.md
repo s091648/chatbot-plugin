@@ -1,263 +1,115 @@
 # Toolbox API Specification
 
-> **Source of truth for external services integrating with the toolbox.**
-> Any service (e.g. scrape-and-analyze) only needs this document to integrate.
+> **Source of truth for the chat completions API.**
+
+## Overview
+
+OpenAI-compatible chat completions with RAG context. The service receives a user message, retrieves relevant chunks from PostgreSQL + pgvector, assembles them into a context window, and generates a reply via a resilient LLM fallback chain (Claude → Gemini → OpenRouter).
 
 ## Base URL
 
-The toolbox runs as a standalone service. Default: `http://localhost:8000`
+```
+http://localhost:8000
+```
 
 ```bash
 uvicorn chatbot_plugin.main:app --reload
 ```
 
-All endpoints are under `/tools`.
-
 ---
 
-## SDK Usage (Python)
+## `POST /v1/chat/completions`
 
-Services may also import the toolbox as a Python SDK instead of calling HTTP endpoints.
-
-```python
-from chatbot_plugin.sdk import IngestToolboxSDK, QueryToolboxSDK
-
-# Ingest SDK — handles text ingestion (normalise → chunk → embed → save)
-from chatbot_plugin.sdk import IngestToolboxSDK
-
-ingest_sdk = IngestToolboxSDK()
-ingest_sdk.configure(
-    dbname="chatbot_plugin",
-    user="postgres",
-    password="postgres",
-    embedding_model_api="http://localhost:8080",  # embedding microservice
-)
-
-await ingest_sdk.ingest(
-    full_text="Retrieval augmented generation is a technique ...",
-    metadata={"url": "https://example.com/article", "title": "RAG 101"},
-)
-
-# Query SDK — handles read-only RAG queries
-query_sdk = QueryToolboxSDK()
-query_sdk.configure(
-    dbname="chatbot_plugin",
-    user="postgres",
-    password="postgres",
-    embedding_model_api="http://localhost:8080",
-)
-
-resp = await query_sdk.query("What is RAG?")
-print(resp.reply)
-```
-
-### Class Hierarchy
-
-| Class | DB | Embedding | Write | Query | LLM |
-|-------|----|-----------|-------|-------|-----|
-| `BaseRagProcessor` (not exported) | ✓ (internal) | — | — | `search()`, `chat()` | ✓ (fallback) |
-| `RagArticleProcessor` | ✓ | ✓ (HTTP) | `ingest()` | inherits base | inherits base |
-| `RagQueryProcessor` | ✓ | ✓ (HTTP) | — | `query()` → `chat()` | inherits base |
-
----
-
-## `POST /tools/chunks`
-
-Store or update an article and its pre-chunked, pre-embedded data.
+OpenAI-compatible chat completions endpoint with RAG augmentation.
 
 ### Request
 
 ```json
 {
-  "article": {
-    "id": "a1b2c3d4-5678-90ab-cdef-1234567890ab",
-    "url": "https://example.com/article",
-    "title": "Article Title",
-    "source": "example.com",
-    "metadata": {"author": "Alice"}
-  },
-  "chunks": [
-    {
-      "chunk_index": 0,
-      "content": "First chunk of text...",
-      "dense_vector": [0.1, 0.2, ..., 0.1024],
-      "sparse_vector": {"0": 0.5, "1": 0.3}
-    }
+  "model": "chatbot-plugin",
+  "messages": [
+    {"role": "system", "content": "You are a helpful assistant."},
+    {"role": "user", "content": "Explain retrieval augmented generation"}
   ]
 }
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `article` | `object` | yes | Article metadata |
-| `article.id` | `string (uuid)` | yes | Article UUID (used as upsert key) |
-| `article.url` | `string (url)` | yes | Source URL |
-| `article.title` | `string` | no | Article title |
-| `article.source` | `string` | no | Source domain / feed name |
-| `article.metadata` | `object` | no | Arbitrary JSON metadata |
-| `chunks` | `array (min 1)` | yes | Pre-chunked, pre-embedded data |
-| `chunks[].chunk_index` | `integer` | yes | Position within article (0-based) |
-| `chunks[].content` | `string` | yes | Chunk text content |
-| `chunks[].dense_vector` | `array[float]` | yes | Dense embedding (must match CHATBOT_EMBEDDING_DIMENSION) |
-| `chunks[].sparse_vector` | `object` | no | Lexical weights as {token_index: weight} |
+| `model` | `string` | yes | Model identifier (passed through to response; does not control LLM selection) |
+| `messages` | `array` | yes | Conversation history. Must contain at least one message with `role: "user"` |
+| `messages[].role` | `string` | yes | `"system"`, `"user"`, or `"assistant"` |
+| `messages[].content` | `string` | yes | Message content |
 
-### Response `201`
+The last `user` message in the array is used as the RAG query.
+
+### Response `200`
 
 ```json
 {
-  "stored": 1,
-  "article_id": "a1b2c3d4-5678-90ab-cdef-1234567890ab"
+  "id": "chatcmpl-abc123",
+  "object": "chat.completion",
+  "model": "chatbot-plugin",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "RAG is a technique where..."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  }
 }
 ```
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `stored` | `integer` | Number of chunks stored |
-| `article_id` | `string (uuid)` | The article UUID (echoed back) |
-
-### Upsert Semantics
-
-- If `article.id` already exists, the existing article metadata is **updated** and all existing chunks for that article are **deleted and re-inserted**.
-- If `article.id` does not exist, a new article and its chunks are inserted.
-- This allows scrape-and-analyze to re-index articles without manual deletion.
-
-### Error Responses
-
-| Code | Condition |
-|------|-----------|
-| `422` | `chunks` array is empty or missing (Pydantic validation) |
-| `400` | `dense_vector` dimension does not match `CHATBOT_EMBEDDING_DIMENSION` (default 1024) |
-| `422` | Invalid JSON shape or field types |
-
-### Edge Cases
-
-- `sparse_vector` omitted on individual chunks → stored as `NULL`/`{}`
-- `title` omitted → stored as `NULL`
-- Empty `metadata` → stored as `NULL`/`{}`
-- Duplicate `chunk_index` values in the same request → last one wins (databases with `ON CONFLICT` will upsert)
-
----
-
-## `POST /tools/search`
-
-Hybrid dense + sparse search. The toolbox embeds the query text locally with BGE-M3, then queries pgvector for the most similar chunks.
-
-### Request
-
-```json
-{
-  "query": "What is retrieval augmented generation?",
-  "top_k": 10
-}
-```
-
-| Field   | Type     | Required | Description                                      |
-|---------|----------|----------|--------------------------------------------------|
-| `query` | `string` | yes      | Raw query text (will be embedded by toolbox)     |
-| `top_k` | `integer`| no       | Number of top chunks to return (default: 10, max: 100) |
-
-### Response `200`
-
-```json
-{
-  "chunks": [
-    {
-      "chunk_id": "uuid-string",
-      "article_id": "uuid-string",
-      "article_title": "Article Title",
-      "article_url": "https://example.com",
-      "chunk_index": 0,
-      "content": "RAG is a technique...",
-      "score": 0.876
-    }
-  ]
-}
-```
-
-| Field              | Type     | Description                                          |
-|--------------------|----------|------------------------------------------------------|
-| `chunks`           | `array`  | Ordered list of matching chunks (best first)         |
-| `chunks[].chunk_id`| `string (uuid)` | Chunk UUID                                    |
-| `chunks[].article_id`| `string (uuid)` | Parent article UUID                          |
-| `chunks[].article_title`| `string` | Article title or `null`                      |
-| `chunks[].article_url` | `string` | Source URL                                   |
-| `chunks[].chunk_index` | `integer`| Position within article                            |
-| `chunks[].content` | `string` | Chunk text content                                   |
-| `chunks[].score`   | `float`  | RRF fusion score (higher is better)                  |
+| `id` | `string` | Unique completion ID |
+| `object` | `string` | Always `"chat.completion"` |
+| `model` | `string` | Echoed from request |
+| `choices` | `array` | Always one element |
+| `choices[].index` | `integer` | Always `0` |
+| `choices[].message.role` | `string` | Always `"assistant"` |
+| `choices[].message.content` | `string` | LLM-generated reply (or raw context if no LLM key is configured) |
+| `choices[].finish_reason` | `string` | Always `"stop"` |
+| `usage` | `object` | Token counts (not tracked; all fields are `0`) |
 
 ### Error Responses
 
 | Code | Condition |
 |------|-----------|
-| `400` | Query text is empty or whitespace-only |
-| `500` | Embedding model is not loaded or LLM call failed |
+| `400` | No `user` message found in the `messages` array |
+| `422` | Invalid request format or missing required fields (Pydantic validation) |
+| `500` | All LLM providers failed and no fallback available |
+
+### Notes
+
+- If no LLM API keys are configured, the endpoint returns the assembled RAG context directly as the reply so callers can still inspect the retrieved sources.
+- LLM provider selection is automatic: Claude → Gemini → OpenRouter. The first provider with a configured API key that succeeds is used.
+- The `model` field in the request does not control which LLM is called. Provider selection is driven by environment variables.
 
 ---
 
-## `POST /tools/chat`
+## Environment Variables
 
-Chat with RAG context. Performs hybrid search, assembles top chunks into context, calls LLM, and returns the reply with citations.
-
-### Request
-
-```json
-{
-  "message": "Explain RAG in simple terms"
-}
-```
-
-| Field     | Type     | Required | Description                                      |
-|-----------|----------|----------|--------------------------------------------------|
-| `message` | `string` | yes      | User message (will be embedded by toolbox)       |
-
-### Response `200`
-
-```json
-{
-  "reply": "RAG is a technique where...",
-  "articles_used": [
-    {
-      "id": "uuid-string",
-      "title": "Article Title",
-      "url": "https://example.com"
-    }
-  ],
-  "chunks": [
-    {
-      "chunk_id": "uuid-string",
-      "article_id": "uuid-string",
-      "chunk_index": 0,
-      "content": "RAG is a technique...",
-      "score": 0.876
-    }
-  ]
-}
-```
-
-| Field           | Type     | Description                                          |
-|-----------------|----------|------------------------------------------------------|
-| `reply`         | `string` | LLM-generated answer                                 |
-| `articles_used` | `array`  | Unique articles that contributed to the context      |
-| `chunks`        | `array`  | All chunks used in the context (ordered by score)    |
-| `chunks[].chunk_id`| `string (uuid)` | Chunk UUID                                    |
-| `chunks[].article_id`| `string (uuid)` | Parent article UUID                          |
-| `chunks[].chunk_index`| `integer`| Position within article                            |
-| `chunks[].content` | `string` | Chunk text content                                   |
-| `chunks[].score` | `float`  | RRF fusion score                                     |
-
-### Error Responses
-
-| Code | Condition |
-|------|-----------|
-| `400` | Message is empty or whitespace-only |
-| `500` | Embedding model is not loaded or LLM call failed |
-| `503` | LLM API key not configured |
-
----
-
-## Sparse Vector Format
-
-- Stored as `sparsevec` in PostgreSQL / pgvector
-- Dimension: `250002` (BGE-M3 tokenizer vocab size)
-- API layer still accepts `dict[str, float]` (token_index → weight)
-- The toolbox translates the dict to sparsevec at storage time
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHATBOT_DATABASE_URL` | `postgresql+asyncpg://postgres:postgres@localhost:5432/chatbot_plugin` | Database URL |
+| `CHATBOT_EMBEDDING_MODEL_API` | `""` | Embedding service URL |
+| `CHATBOT_ENABLE_RERANKER` | `""` | Set to `"true"` to enable cross-encoder reranking |
+| `CHATBOT_RETRIEVAL_MIN_SCORE` | `0.0` | Pre-rerank score threshold |
+| `CHATBOT_RERANKER_MIN_SCORE` | `0.7` | Post-rerank score threshold |
+| `CHATBOT_MAX_CONTEXT_CHUNKS` | `10` | Max chunks included in the LLM context |
+| `CHATBOT_MAX_TOKENS` | `2048` | Max LLM output tokens |
+| `CHATBOT_CLAUDE_API_KEY` | `""` | Anthropic API key |
+| `CHATBOT_CLAUDE_MODEL` | `claude-sonnet-4-6-20250514` | Claude model |
+| `CHATBOT_GEMINI_API_KEY` | `""` | Google Gemini API key |
+| `CHATBOT_GEMINI_MODEL` | `gemini-2.0-flash` | Gemini model |
+| `CHATBOT_OPENROUTER_API_KEY` | `""` | OpenRouter API key |
+| `CHATBOT_OPENROUTER_MODEL` | `meta-llama/llama-3-70b` | OpenRouter model |

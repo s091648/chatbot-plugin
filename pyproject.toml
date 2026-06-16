@@ -8,6 +8,10 @@ dependencies = [
     "uvicorn[standard]",
     "pydantic>=2.0",
     "chatbot-plugin-sdk",
+    "anthropic",
+    "google-genai>=1.0",
+    "httpx",
+    "tenacity",
 ]
 
 [tool.uv.sources]

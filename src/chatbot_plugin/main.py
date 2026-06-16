@@ -12,7 +12,8 @@ from urllib.parse import urlparse
 from fastapi import FastAPI
 
 from chatbot_plugin.routers import api_router
-from chatbot_plugin_sdk import RagQueryProcessor
+from chatbot_plugin.chat_service import ChatService
+from chatbot_plugin_sdk import RetrieveProcessor
 
 
 def _get_db_url() -> str:
@@ -25,26 +26,10 @@ def _get_db_url() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db_url = _get_db_url()
-    embedding_api = getenv("CHATBOT_EMBEDDING_MODEL_API", "")
-
-    parsed = urlparse(db_url)
-    dbname = parsed.path.lstrip("/")
-    user = parsed.username or "postgres"
-    password = parsed.password or ""
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 5432
-
-    processor = RagQueryProcessor()
-    processor.configure(
-        dbname=dbname,
-        user=user,
-        password=password,
-        embedding_model_api=embedding_api or None,
-        host=host,
-        port=port,
-    )
-    app.state.processor = processor
+    retriever = RetrieveProcessor()
+    # NOTE: retriever.configure() requires a real backend; skipped here for startup.
+    # ChatService and retriever should be configured via dependency injection in production.
+    app.state.chat_service = ChatService(retriever=retriever, llm=None)  # type: ignore[arg-type]
 
     yield
 

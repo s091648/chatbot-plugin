@@ -10,17 +10,17 @@ from chatbot_plugin.contracts.chat_completion import (
     ChatCompletionChoice,
     ChatCompletionChoiceMessage,
 )
-from chatbot_plugin_sdk import RagQueryProcessor
+from chatbot_plugin.chat_service import ChatService
 
 api_router = APIRouter(prefix="/v1")
 
 
-def _get_processor(request: Request) -> RagQueryProcessor:
-    processor: RagQueryProcessor | None = \
-        getattr(request.app.state, "processor", None)
-    if processor is None:
-        raise HTTPException(status_code=500, detail="RagQueryProcessor not initialised")
-    return processor
+def _get_chat_service(request: Request) -> ChatService:
+    service: ChatService | None = \
+        getattr(request.app.state, "chat_service", None)
+    if service is None:
+        raise HTTPException(status_code=500, detail="ChatService not initialised")
+    return service
 
 
 @api_router.post("/chat/completions", response_model=ChatCompletionResponse)
@@ -29,7 +29,7 @@ async def chat_completions(
     request: Request,
 ) -> ChatCompletionResponse:
     """OpenAI-compatible chat completions with RAG context."""
-    processor = _get_processor(request)
+    service = _get_chat_service(request)
 
     last_message = req.get_last_user_message()
     if not last_message.strip():
@@ -38,7 +38,7 @@ async def chat_completions(
             detail="messages must contain at least one user message with non-empty content",
         )
 
-    result = await processor.chat(last_message)
+    result = await service.chat(last_message)
 
     return ChatCompletionResponse(
         model="rag-default",

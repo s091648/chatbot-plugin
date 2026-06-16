@@ -4,26 +4,22 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient
 
-from chatbot_plugin_sdk import RagQueryProcessor
+from chatbot_plugin.chat_service import ChatService, ChatResult
 
 
 class TestChatCompletions:
     @pytest.mark.asyncio
     async def test_accepts_valid_messages(self, client: AsyncClient):
         with patch.object(
-            RagQueryProcessor,
+            ChatService,
             "chat",
             new_callable=AsyncMock,
         ) as mock:
-            mock.return_value = type(
-                "ChatResponse",
-                (),
-                {
-                    "reply": "RAG is a retrieval technique...",
-                    "articles_used": [],
-                    "chunks": [],
-                },
-            )()
+            mock.return_value = ChatResult(
+                reply="RAG is a retrieval technique...",
+                articles_used=[],
+                chunks=[],
+            )
             resp = await client.post(
                 "/v1/chat/completions",
                 json={
@@ -62,19 +58,15 @@ class TestChatCompletions:
     @pytest.mark.asyncio
     async def test_default_model(self, client: AsyncClient):
         with patch.object(
-            RagQueryProcessor,
+            ChatService,
             "chat",
             new_callable=AsyncMock,
         ) as mock:
-            mock.return_value = type(
-                "ChatResponse",
-                (),
-                {
-                    "reply": "Hello",
-                    "articles_used": [],
-                    "chunks": [],
-                },
-            )()
+            mock.return_value = ChatResult(
+                reply="Hello",
+                articles_used=[],
+                chunks=[],
+            )
             resp = await client.post(
                 "/v1/chat/completions",
                 json={

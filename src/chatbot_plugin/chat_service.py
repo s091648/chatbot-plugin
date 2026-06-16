@@ -32,6 +32,7 @@ class ArticleRef:
     id: str
     title: str | None
     url: str
+    public_article_id: str | None = None
 
 
 @dataclass
@@ -99,5 +100,6 @@ class ChatService:
                     id=chunk.article_id,
                     title=chunk.article_title,
                     url=chunk.article_url or "",
+                    public_article_id=chunk.public_article_id,
                 )
         return list(seen.values())

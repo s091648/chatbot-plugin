@@ -75,6 +75,21 @@ async def chat_completions(
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
             }
             yield f"data: {json.dumps(done_chunk)}\n\n".encode()
+
+            if result.articles_used:
+                sources_payload = {
+                    "sources": [
+                        {
+                            "id": ref.id,
+                            "title": ref.title,
+                            "url": ref.url,
+                            "public_article_id": ref.public_article_id,
+                        }
+                        for ref in result.articles_used
+                    ]
+                }
+                yield f"data: {json.dumps(sources_payload)}\n\n".encode()
+
             yield b"data: [DONE]\n\n"
 
         return StreamingResponse(

@@ -65,7 +65,7 @@ class ChatService:
             top_k=self._max_context_chunks,
             min_score=self._min_score,
             min_rerank_score=self._min_rerank_score,
-            topic_id=topic_id,
+            filters={"topic_id": topic_id} if topic_id else None,
         )
 
         if not search_result.chunks:
@@ -89,7 +89,7 @@ class ChatService:
     def _build_context(self, chunks: list[ChunkResult]) -> str:
         parts = []
         for chunk in chunks:
-            title = chunk.article_title or "Unknown"
+            title = chunk.article_metadata.get("title") or "Unknown"
             parts.append(f"[source: {title}]\n{chunk.content}")
         return "\n\n".join(parts)
 
@@ -97,10 +97,11 @@ class ChatService:
         seen: dict[str, ArticleRef] = {}
         for chunk in chunks:
             if chunk.article_id not in seen:
+                meta = chunk.article_metadata
                 seen[chunk.article_id] = ArticleRef(
                     id=chunk.article_id,
-                    title=chunk.article_title,
-                    url=chunk.article_url or "",
-                    public_article_id=chunk.public_article_id,
+                    title=meta.get("title"),
+                    url=meta.get("url") or "",
+                    public_article_id=meta.get("public_article_id"),
                 )
         return list(seen.values())

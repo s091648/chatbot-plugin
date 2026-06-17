@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-chatbot-plugin-sdk = { git = "https://github.com/s091648/chatbot-plugin-sdk.git", tag = "v0.4.0" }
+chatbot-plugin-sdk = { git = "https://github.com/s091648/chatbot-plugin-sdk.git", tag = "v0.6.0" }
 
 [dependency-groups]
 dev = [

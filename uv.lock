@@ -309,7 +309,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic" },
-    { name = "chatbot-plugin-sdk", git = "https://github.com/s091648/chatbot-plugin-sdk.git?tag=v0.4.0" },
+    { name = "chatbot-plugin-sdk", git = "https://github.com/s091648/chatbot-plugin-sdk.git?tag=v0.6.0" },
     { name = "fastapi" },
     { name = "fastembed", specifier = ">=0.3" },
     { name = "google-genai", specifier = ">=1.0" },
@@ -330,7 +330,7 @@ dev = [
 [[package]]
 name = "chatbot-plugin-sdk"
 version = "0.5.1"
-source = { git = "https://github.com/s091648/chatbot-plugin-sdk.git?tag=v0.4.0#2747a6d176b1a3c68d32518799aeadd7dec354d3" }
+source = { git = "https://github.com/s091648/chatbot-plugin-sdk.git?tag=v0.6.0#1f8753d52d912ce0b00054ede7f3688c2f22ed8b" }
 dependencies = [
     { name = "asyncpg" },
     { name = "httpx" },

@@ -59,12 +59,13 @@ class ChatService:
         self._min_score = min_score
         self._min_rerank_score = min_rerank_score
 
-    async def chat(self, message: str) -> ChatResult:
+    async def chat(self, message: str, topic_id: str | None = None) -> ChatResult:
         search_result = await self._retriever.retrieve(
             message,
             top_k=self._max_context_chunks,
             min_score=self._min_score,
             min_rerank_score=self._min_rerank_score,
+            topic_id=topic_id,
         )
 
         if not search_result.chunks:

@@ -18,6 +18,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=2048, ge=1, le=8192)
     stream: bool = Field(default=False)
+    topic_id: str | None = Field(default=None, description="filter retrieval to a specific topic UUID")
 
     def get_last_user_message(self) -> str:
         """Return the last user message, or raise if missing."""

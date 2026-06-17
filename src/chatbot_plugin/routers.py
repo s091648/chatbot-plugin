@@ -55,7 +55,7 @@ async def chat_completions(
             detail="messages must contain at least one user message with non-empty content",
         )
 
-    result = await service.chat(last_message)
+    result = await service.chat(last_message, topic_id=req.topic_id)
 
     if req.stream:
         cid = f"chatcmpl-{secrets.token_hex(12)}"

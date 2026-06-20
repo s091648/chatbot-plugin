@@ -98,10 +98,11 @@ class ChatService:
         for chunk in chunks:
             if chunk.article_id not in seen:
                 meta = chunk.article_metadata
+                raw_pid = meta.get("public_article_id")
                 seen[chunk.article_id] = ArticleRef(
                     id=chunk.article_id,
                     title=meta.get("title"),
                     url=meta.get("url") or "",
-                    public_article_id=meta.get("public_article_id"),
+                    public_article_id=str(raw_pid) if raw_pid is not None else None,
                 )
         return list(seen.values())

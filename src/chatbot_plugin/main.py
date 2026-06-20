@@ -17,8 +17,8 @@ from chatbot_plugin.llm.base import ResilientLLMService, ProviderHandler
 from chatbot_plugin_sdk import (
     AsyncPgBackend,
     DatabaseConfig,
+    EndpointProvider,
     FastEmbedReranker,
-    FastEmbedSparseProvider,
     GeminiDenseProvider,
     RetrieveProcessor,
     SlidingWindowStrategy,
@@ -45,8 +45,9 @@ async def lifespan(app: FastAPI):
         model=getenv("RAG_DENSE_MODEL", "gemini-embedding-001"),
         dimension=int(getenv("RAG_DENSE_DIMENSION", "768")),
     )
-    sparse = FastEmbedSparseProvider(
-        model=getenv("RAG_SPARSE_MODEL", "prithvida/Splade_PP_en_v1"),
+    sparse = EndpointProvider(
+        url=getenv("RAG_SPARSE_ENDPOINT_URL", "http://fastembed:8080"),
+        response_key="sparse",
         dimension=int(getenv("RAG_SPARSE_DIMENSION", "30522")),
     )
     reranker = FastEmbedReranker(

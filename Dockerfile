@@ -1,9 +1,10 @@
-# --- Stage 1: Build ---
+# --- Stage 1: Build & preload reranker model ---
 FROM python:3.12-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
+    FASTEMBED_CACHE_PATH=/app/.fastembed_cache \
     PORT=8000
 
 WORKDIR /app
@@ -22,17 +23,30 @@ COPY --from=ghcr.io/astral-sh/uv:0.10.12 /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
+# Sparse embedding 已移至獨立的 fastembed service；這裡只預載 reranker
+ARG RAG_RERANKER_MODEL=jinaai/jina-reranker-v2-base-multilingual
+
+RUN set -eu; \
+    cache="$FASTEMBED_CACHE_PATH"; \
+    mkdir -p "$cache"; \
+    if [ -n "$RAG_RERANKER_MODEL" ]; then \
+        echo "Downloading reranker model: $RAG_RERANKER_MODEL"; \
+        /app/.venv/bin/python -c "from fastembed.rerank.cross_encoder import TextCrossEncoder; TextCrossEncoder('$RAG_RERANKER_MODEL', cache_dir='$cache')"; \
+    fi
+
 # --- Stage 2: Run ---
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app/src \
+    FASTEMBED_CACHE_PATH=/app/.fastembed_cache \
     PORT=8000
 
 WORKDIR /app
 
 COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/.fastembed_cache /app/.fastembed_cache
 
 # Editable install needs the source checked out at the sibling path
 COPY --from=builder /chatbot-plugin-sdk /chatbot-plugin-sdk
@@ -41,8 +55,8 @@ COPY src/ ./src/
 COPY alembic/ ./alembic/
 COPY alembic.ini .
 
-RUN addgroup --system appuser && adduser --system --group appuser
-RUN chown -R appuser:appuser /app
+RUN addgroup --system appuser && adduser --system --group appuser && \
+    chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8000

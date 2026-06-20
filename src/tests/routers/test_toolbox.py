@@ -4,7 +4,7 @@ import pytest
 from unittest.mock import AsyncMock, patch
 from httpx import AsyncClient
 
-from chatbot_plugin.chat_service import ChatService, ChatResult
+from chatbot_plugin.services.chat_service import ChatService, ChatResult
 
 
 class TestChatCompletions:

@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chatbot_plugin_sdk.contracts.responses import ChunkResult, SearchResponse
-from chatbot_plugin.chat_service import ChatService, ArticleRef, SYSTEM_PROMPT
+from chatbot_plugin.services.chat_service import ChatService, ArticleRef, SYSTEM_PROMPT
 
 
 def _chunk(chunk_id="c1", article_id="a1", title="Test Article", url="https://test.com", content="RAG is retrieval-augmented generation.", score=0.9):

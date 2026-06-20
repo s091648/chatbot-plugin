@@ -39,7 +39,7 @@ class ArticleRef:
 class ChatResult:
     reply: str
     articles_used: list[ArticleRef]
-    chunks: list[ChunkResult]
+    chunks: list[ChunkResult] = field(default_factory=list)
 
 
 class ChatService:
@@ -78,12 +78,10 @@ class ChatService:
         ]
 
         reply = await self._llm.complete(messages, self._max_tokens)
-
         if reply is None:
             reply = f"{context}\n\nQuestion: {message}"
 
         articles = self._collect_articles(search_result.chunks)
-
         return ChatResult(reply=reply, articles_used=articles, chunks=search_result.chunks)
 
     def _build_context(self, chunks: list[ChunkResult]) -> str:

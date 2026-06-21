@@ -11,12 +11,13 @@ logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You are a research assistant that answers questions based ONLY on the
-provided context chunks. Each chunk is annotated with its source article.
+provided context chunks. Each chunk is prefixed with [N] indicating its source article number.
 
 Rules:
 - Answer using only the information in the context below.
 - If the context does not contain enough information to answer, say so.
-- Cite the source article title when referencing specific information.
+- Use inline [N] citations (e.g. [1], [2]) immediately after each claim to indicate its source.
+- Do not list sources separately at the end — citations must be inline only.
 - Do not use external knowledge or make assumptions beyond the context.
 - Respond in the same language as the user's question.
 """
@@ -71,7 +72,8 @@ class ChatService:
         if not search_result.chunks:
             return ChatResult(reply=_NO_RELEVANT_INFO_REPLY, articles_used=[], chunks=[])
 
-        context = self._build_context(search_result.chunks)
+        articles, article_index = self._collect_articles(search_result.chunks)
+        context = self._build_context(search_result.chunks, article_index)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
@@ -81,18 +83,14 @@ class ChatService:
         if reply is None:
             reply = f"{context}\n\nQuestion: {message}"
 
-        articles = self._collect_articles(search_result.chunks)
         return ChatResult(reply=reply, articles_used=articles, chunks=search_result.chunks)
 
-    def _build_context(self, chunks: list[ChunkResult]) -> str:
-        parts = []
-        for chunk in chunks:
-            title = chunk.article_metadata.get("title") or "Unknown"
-            parts.append(f"[source: {title}]\n{chunk.content}")
-        return "\n\n".join(parts)
-
-    def _collect_articles(self, chunks: list[ChunkResult]) -> list[ArticleRef]:
+    def _collect_articles(
+        self, chunks: list[ChunkResult]
+    ) -> tuple[list[ArticleRef], dict[str, int]]:
+        """Returns (unique articles in first-appearance order, article_id → 1-based index)."""
         seen: dict[str, ArticleRef] = {}
+        index: dict[str, int] = {}
         for chunk in chunks:
             if chunk.article_id not in seen:
                 meta = chunk.article_metadata
@@ -103,4 +101,13 @@ class ChatService:
                     url=meta.get("url") or "",
                     public_article_id=str(raw_pid) if raw_pid is not None else None,
                 )
-        return list(seen.values())
+                index[chunk.article_id] = len(seen)
+        return list(seen.values()), index
+
+    def _build_context(self, chunks: list[ChunkResult], article_index: dict[str, int]) -> str:
+        parts = []
+        for chunk in chunks:
+            n = article_index.get(chunk.article_id, 0)
+            title = chunk.article_metadata.get("title") or "Unknown"
+            parts.append(f"[{n}] {title}\n{chunk.content}")
+        return "\n\n".join(parts)

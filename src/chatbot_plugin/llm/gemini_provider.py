@@ -55,7 +55,9 @@ class GeminiProvider:
         fr_name = fr.name if hasattr(fr, "name") else str(fr)
         if fr_name not in ("STOP", "1"):
             logger.warning("gemini_blocked", extra={"model": self.model, "finish_reason": fr_name})
-            return ""
+            if fr_name != "MAX_TOKENS":
+                return ""
+            # MAX_TOKENS: response is truncated but still usable — fall through
 
-        logger.info("gemini_api_called", extra={"model": self.model})
+        logger.info("gemini_api_called", extra={"model": self.model, "finish_reason": fr_name})
         return (response.text or "").strip()

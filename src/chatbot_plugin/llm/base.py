@@ -48,6 +48,10 @@ class ProviderHandler:
         return result
 
 
+class AllProvidersExhausted(Exception):
+    """Raised when every LLM provider has failed or hit its rate limit."""
+
+
 class ResilientLLMService:
     """Walk an ordered list of ProviderHandlers. Fall back on rate-limit or failure."""
 

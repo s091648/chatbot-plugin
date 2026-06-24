@@ -12,7 +12,11 @@ from chatbot_plugin.config import (
     VECTOR_DB_NAME, VECTOR_DB_USER, VECTOR_DB_PASSWORD,
     VECTOR_DB_HOST, VECTOR_DB_PORT, VECTOR_DB_SCHEMA,
     VECTOR_DB_ARTICLES_TABLE, VECTOR_DB_CHUNKS_TABLE,
-    RAG_GEMINI_API_KEY, GEMINI_MODEL, GEMINI_RPM,
+    RAG_GEMINI_API_KEY,
+    GEMINI_MODEL_1, GEMINI_RPM_1, GEMINI_TPM_1, GEMINI_RPD_1,
+    GEMINI_MODEL_2, GEMINI_RPM_2, GEMINI_TPM_2, GEMINI_RPD_2,
+    GEMINI_MODEL_3, GEMINI_RPM_3, GEMINI_TPM_3, GEMINI_RPD_3,
+    GEMINI_MODEL_4, GEMINI_RPM_4, GEMINI_TPM_4, GEMINI_RPD_4,
     RAG_DENSE_MODEL, RAG_DENSE_DIMENSION,
     RAG_SPARSE_ENDPOINT_URL, RAG_SPARSE_DIMENSION,
     RAG_RERANKER_MODEL,
@@ -73,14 +77,19 @@ async def lifespan(app: FastAPI):
     retriever = RetrieveProcessor()
     retriever.configure(backend=backend, dense=dense, sparse=sparse, reranker=reranker)
 
-    gemini_llm = GeminiProvider(api_key=RAG_GEMINI_API_KEY, model=GEMINI_MODEL)
-    llm_service = ResilientLLMService(handlers=[
-        ProviderHandler(
-            provider=gemini_llm,
-            strategy=SlidingWindowStrategy(rpm=GEMINI_RPM),
-            priority=1,
-            name="gemini",
+    def _gemini_handler(model: str, rpm: int, tpm: int, rpd: int, priority: int) -> ProviderHandler:
+        return ProviderHandler(
+            provider=GeminiProvider(api_key=RAG_GEMINI_API_KEY, model=model),
+            strategy=SlidingWindowStrategy(rpm=rpm, tpm=tpm, rpd=rpd),
+            priority=priority,
+            name=model,
         )
+
+    llm_service = ResilientLLMService(handlers=[
+        _gemini_handler(GEMINI_MODEL_1, GEMINI_RPM_1, GEMINI_TPM_1, GEMINI_RPD_1, 1),
+        _gemini_handler(GEMINI_MODEL_2, GEMINI_RPM_2, GEMINI_TPM_2, GEMINI_RPD_2, 2),
+        _gemini_handler(GEMINI_MODEL_3, GEMINI_RPM_3, GEMINI_TPM_3, GEMINI_RPD_3, 3),
+        _gemini_handler(GEMINI_MODEL_4, GEMINI_RPM_4, GEMINI_TPM_4, GEMINI_RPD_4, 4),
     ])
 
     app.state.chat_service = ChatService(

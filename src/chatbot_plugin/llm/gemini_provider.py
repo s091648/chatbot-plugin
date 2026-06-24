@@ -38,7 +38,12 @@ class GeminiProvider:
                 lambda: self._client.models.generate_content(
                     model=self.model,
                     contents=contents,
-                    config=genai.types.GenerateContentConfig(max_output_tokens=max_tokens),
+                    config=genai.types.GenerateContentConfig(
+                        max_output_tokens=max_tokens,
+                        automatic_function_calling=genai.types.AutomaticFunctionCallingConfig(
+                            disable=True,
+                        ),
+                    ),
                 ),
             )
         except Exception as e:
@@ -59,5 +64,16 @@ class GeminiProvider:
                 return ""
             # MAX_TOKENS: response is truncated but still usable — fall through
 
-        logger.info("gemini_api_called", extra={"model": self.model, "finish_reason": fr_name})
-        return (response.text or "").strip()
+        # response.text may return None for thinking models (gemini-3-flash-preview etc.)
+        # where the response has thought=True parts alongside the final text parts.
+        # Fall back to manual extraction of non-thinking text parts.
+        text = response.text
+        if not text:
+            parts = (candidate.content.parts if candidate.content else [])
+            text = "".join(
+                p.text for p in parts
+                if getattr(p, "text", None) and not getattr(p, "thought", False)
+            )
+
+        logger.info("gemini_api_called", extra={"model": self.model, "finish_reason": fr_name, "reply_len": len(text)})
+        return text.strip()

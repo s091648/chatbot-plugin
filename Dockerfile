@@ -23,8 +23,9 @@ COPY --from=ghcr.io/astral-sh/uv:0.10.12 /uv /usr/local/bin/uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
-# Sparse embedding 已移至獨立的 fastembed service；這裡只預載 reranker
-ARG RAG_RERANKER_MODEL=jinaai/jina-reranker-v2-base-multilingual
+# Set RAG_RERANKER_MODEL build arg (via Railway Variables) to bake in a reranker model.
+# Default is empty — no model downloaded, no memory cost at runtime.
+ARG RAG_RERANKER_MODEL=
 
 RUN set -eu; \
     cache="$FASTEMBED_CACHE_PATH"; \

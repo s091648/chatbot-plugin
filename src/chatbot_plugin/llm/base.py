@@ -9,6 +9,10 @@ from chatbot_plugin_sdk import SlidingWindowStrategy, RateLimitExhausted
 logger = logging.getLogger(__name__)
 
 
+class AllProvidersExhausted(Exception):
+    """Raised when every LLM provider has failed or hit its rate limit."""
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     model: str
@@ -54,9 +58,9 @@ class ResilientLLMService:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> str | None:
+    ) -> str:
         if not self._handlers:
-            return None
+            raise AllProvidersExhausted()
 
         handlers_snapshot = list(self._handlers)
 
@@ -75,4 +79,4 @@ class ResilientLLMService:
                 logger.error("provider_failed", extra={"provider": handler.name, "error": str(e)})
 
         logger.error("all_providers_exhausted")
-        return None
+        raise AllProvidersExhausted()

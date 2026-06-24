@@ -80,9 +80,6 @@ class ChatService:
         ]
 
         reply = await self._llm.complete(messages, self._max_tokens)
-        if reply is None:
-            reply = f"{context}\n\nQuestion: {message}"
-
         return ChatResult(reply=reply, articles_used=articles, chunks=search_result.chunks)
 
     def _collect_articles(

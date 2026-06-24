@@ -68,7 +68,7 @@ async def lifespan(app: FastAPI):
         response_key="sparse",
         dimension=RAG_SPARSE_DIMENSION,
     )
-    reranker = FastEmbedReranker(model_name=RAG_RERANKER_MODEL)
+    reranker = FastEmbedReranker(model_name=RAG_RERANKER_MODEL) if RAG_RERANKER_MODEL else None
 
     retriever = RetrieveProcessor()
     retriever.configure(backend=backend, dense=dense, sparse=sparse, reranker=reranker)

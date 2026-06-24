@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from chatbot_plugin.config import CHAT_SERVICE_API_KEY
+from chatbot_plugin.llm.base import AllProvidersExhausted
 from chatbot_plugin.contracts.chat_completion import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -48,7 +49,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             detail="messages must contain at least one user message with non-empty content",
         )
 
-    result = await service.chat(last_message, topic_id=req.topic_id)
+    try:
+        result = await service.chat(last_message, topic_id=req.topic_id)
+    except AllProvidersExhausted:
+        raise HTTPException(
+            status_code=503,
+            detail="All LLM providers are currently unavailable. Please try again later.",
+        )
 
     if req.stream:
         cid = f"chatcmpl-{secrets.token_hex(12)}"

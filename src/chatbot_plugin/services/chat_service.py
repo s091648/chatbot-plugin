@@ -27,7 +27,6 @@ _NO_RELEVANT_INFO_REPLY = (
     "Please try rephrasing or ask about a different topic."
 )
 
-
 @dataclass
 class ArticleRef:
     id: str
@@ -61,7 +60,12 @@ class ChatService:
         self._min_score = min_score
         self._min_rerank_score = min_rerank_score
 
-    async def chat(self, message: str, topic_id: str | None = None) -> ChatResult:
+    async def chat(
+        self,
+        message: str,
+        topic_id: str | None = None,
+        pinned_article_ids: list[str] | None = None,
+    ) -> ChatResult:
         search_result = await self._retriever.retrieve(
             message,
             top_k=self._max_context_chunks,
@@ -70,18 +74,52 @@ class ChatService:
             filters={"topic_id": topic_id} if topic_id else None,
         )
 
-        if not search_result.chunks:
+        pinned_chunks = await self._fetch_pinned_chunks(message, pinned_article_ids or [])
+
+        # Pinned chunks first, then semantic results — dedup by chunk_id
+        seen: set[str] = set()
+        merged: list[ChunkResult] = []
+        for chunk in pinned_chunks + search_result.chunks:
+            if chunk.chunk_id not in seen:
+                seen.add(chunk.chunk_id)
+                merged.append(chunk)
+        merged = merged[:self._max_context_chunks]
+
+        if not merged:
             return ChatResult(reply=_NO_RELEVANT_INFO_REPLY, articles_used=[], chunks=[])
 
-        articles, article_index = self._collect_articles(search_result.chunks)
-        context = self._build_context(search_result.chunks, article_index)
+        articles, article_index = self._collect_articles(merged)
+        context = self._build_context(merged, article_index)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
         ]
 
         thinking, reply = await self._llm.complete(messages, self._max_tokens)
-        return ChatResult(reply=reply, articles_used=articles, thinking=thinking, chunks=search_result.chunks)
+        return ChatResult(reply=reply, articles_used=articles, thinking=thinking, chunks=merged)
+
+    async def _fetch_pinned_chunks(self, message: str, public_article_ids: list[str]) -> list[ChunkResult]:
+        if not public_article_ids:
+            return []
+
+        # Allocate slots fairly across articles; minimum 3 chunks per article
+        per_article_k = max(self._max_context_chunks // len(public_article_ids), 3)
+
+        results: list[ChunkResult] = []
+        for pid in public_article_ids:
+            try:
+                result = await self._retriever.retrieve(
+                    message,
+                    top_k=per_article_k,
+                    min_score=self._min_score,
+                    min_rerank_score=self._min_rerank_score,
+                    filters={"public_article_id": pid},
+                )
+                results.extend(result.chunks)
+            except Exception:
+                logger.exception("pinned_chunk_retrieve_failed", extra={"article_id": pid})
+
+        return results
 
     def _collect_articles(
         self, chunks: list[ChunkResult]

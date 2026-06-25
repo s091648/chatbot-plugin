@@ -50,7 +50,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         )
 
     try:
-        result = await service.chat(last_message, topic_id=req.topic_id)
+        result = await service.chat(last_message, topic_id=req.topic_id, pinned_article_ids=req.pinned_article_ids)
     except AllProvidersExhausted:
         raise HTTPException(
             status_code=503,

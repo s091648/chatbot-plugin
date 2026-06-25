@@ -40,6 +40,7 @@ class ArticleRef:
 class ChatResult:
     reply: str
     articles_used: list[ArticleRef]
+    thinking: str | None = None
     chunks: list[ChunkResult] = field(default_factory=list)
 
 
@@ -79,8 +80,8 @@ class ChatService:
             {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
         ]
 
-        reply = await self._llm.complete(messages, self._max_tokens)
-        return ChatResult(reply=reply, articles_used=articles, chunks=search_result.chunks)
+        thinking, reply = await self._llm.complete(messages, self._max_tokens)
+        return ChatResult(reply=reply, articles_used=articles, thinking=thinking, chunks=search_result.chunks)
 
     def _collect_articles(
         self, chunks: list[ChunkResult]

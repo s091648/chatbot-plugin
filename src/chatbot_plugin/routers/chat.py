@@ -62,6 +62,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         ts = int(time.time())
 
         async def sse_generator():
+            if result.thinking:
+                thinking_payload = {"thinking": result.thinking}
+                yield f"data: {json.dumps(thinking_payload)}\n\n".encode()
+
             content_chunk = {
                 "id": cid, "object": "chat.completion.chunk",
                 "created": ts, "model": req.model,

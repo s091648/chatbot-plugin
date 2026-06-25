@@ -21,9 +21,10 @@ class LLMProvider(Protocol):
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> str:
-        """Send messages array, return assistant text reply.
+    ) -> tuple[str | None, str]:
+        """Send messages array, return (thinking, reply) tuple.
 
+        thinking is None for providers that don't support extended thinking.
         messages format: [{"role": "system"|"user", "content": "..."}]
         """
         ...
@@ -40,16 +41,12 @@ class ProviderHandler:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str | None, str]:
         estimated_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
         await self.strategy.acquire(estimated_tokens=estimated_tokens)
         result = await self.provider.complete(messages, max_tokens)
         self.strategy.record_usage(estimated_tokens)
         return result
-
-
-class AllProvidersExhausted(Exception):
-    """Raised when every LLM provider has failed or hit its rate limit."""
 
 
 class ResilientLLMService:
@@ -62,7 +59,7 @@ class ResilientLLMService:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str | None, str]:
         if not self._handlers:
             raise AllProvidersExhausted()
 
@@ -70,9 +67,9 @@ class ResilientLLMService:
 
         for handler in handlers_snapshot:
             try:
-                result = await handler.complete(messages, max_tokens)
-                if result is not None:
-                    return result
+                thinking, reply = await handler.complete(messages, max_tokens)
+                if reply is not None:
+                    return (thinking, reply)
                 logger.warning("provider_returned_none", extra={"provider": handler.name})
             except RateLimitExhausted:
                 logger.warning("provider_daily_limit_reached", extra={"provider": handler.name})

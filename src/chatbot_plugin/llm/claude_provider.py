@@ -6,6 +6,8 @@ import anthropic
 
 logger = logging.getLogger(__name__)
 
+_THINKING_BUDGET = 1024
+
 
 class ClaudeProvider:
     """Anthropic Claude LLM provider."""
@@ -18,14 +20,28 @@ class ClaudeProvider:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str | None, str]:
         response = await self._client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
+            thinking={"type": "enabled", "budget_tokens": _THINKING_BUDGET},
             messages=messages,
         )
         logger.info(
             "claude_api_called",
-            extra={"model": self.model, "input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens},
+            extra={
+                "model": self.model,
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            },
         )
-        return response.content[0].text
+
+        thinking: str | None = None
+        reply = ""
+        for block in response.content:
+            if block.type == "thinking":
+                thinking = block.thinking
+            elif block.type == "text":
+                reply += block.text
+
+        return (thinking, reply)

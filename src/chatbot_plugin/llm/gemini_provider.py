@@ -21,7 +21,7 @@ class GeminiProvider:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str | None, str]:
         parts = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -53,7 +53,7 @@ class GeminiProvider:
             raise
 
         if not response.candidates:
-            return ""
+            return (None, "")
 
         candidate = response.candidates[0]
         fr = candidate.finish_reason
@@ -61,19 +61,37 @@ class GeminiProvider:
         if fr_name not in ("STOP", "1"):
             logger.warning("gemini_blocked", extra={"model": self.model, "finish_reason": fr_name})
             if fr_name != "MAX_TOKENS":
-                return ""
-            # MAX_TOKENS: response is truncated but still usable — fall through
+                return (None, "")
 
-        # response.text may return None for thinking models (gemini-3-flash-preview etc.)
-        # where the response has thought=True parts alongside the final text parts.
-        # Fall back to manual extraction of non-thinking text parts.
-        text = response.text
-        if not text:
-            parts = (candidate.content.parts if candidate.content else [])
-            text = "".join(
-                p.text for p in parts
-                if getattr(p, "text", None) and not getattr(p, "thought", False)
-            )
+        # Separate thinking parts (thought=True) from reply parts (thought=False).
+        # Non-thinking models only have reply parts; response.text is a safe fallback.
+        content_parts = candidate.content.parts if candidate.content else []
+        thinking_chunks: list[str] = []
+        reply_chunks: list[str] = []
 
-        logger.info("gemini_api_called", extra={"model": self.model, "finish_reason": fr_name, "reply_len": len(text)})
-        return text.strip()
+        for p in content_parts:
+            text = getattr(p, "text", None)
+            if not text:
+                continue
+            if getattr(p, "thought", False):
+                thinking_chunks.append(text)
+            else:
+                reply_chunks.append(text)
+
+        # Fallback for non-thinking models where parts may be empty
+        if not reply_chunks and not thinking_chunks:
+            reply_chunks.append(response.text or "")
+
+        thinking = "".join(thinking_chunks).strip() or None
+        reply = "".join(reply_chunks).strip()
+
+        logger.info(
+            "gemini_api_called",
+            extra={
+                "model": self.model,
+                "finish_reason": fr_name,
+                "reply_len": len(reply),
+                "has_thinking": thinking is not None,
+            },
+        )
+        return (thinking, reply)

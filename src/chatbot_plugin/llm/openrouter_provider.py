@@ -20,7 +20,7 @@ class OpenRouterProvider:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> str:
+    ) -> tuple[str | None, str]:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 _API_URL,
@@ -39,4 +39,4 @@ class OpenRouterProvider:
             data = response.json()
 
         logger.info("openrouter_api_called", model=self.model)
-        return data["choices"][0]["message"]["content"]
+        return (None, data["choices"][0]["message"]["content"])

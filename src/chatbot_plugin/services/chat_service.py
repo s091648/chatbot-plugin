@@ -102,24 +102,18 @@ class ChatService:
         if not public_article_ids:
             return []
 
-        # Allocate slots fairly across articles; minimum 3 chunks per article
-        per_article_k = max(self._max_context_chunks // len(public_article_ids), 3)
-
-        results: list[ChunkResult] = []
-        for pid in public_article_ids:
-            try:
-                result = await self._retriever.retrieve(
-                    message,
-                    top_k=per_article_k,
-                    min_score=self._min_score,
-                    min_rerank_score=self._min_rerank_score,
-                    filters={"public_article_id": pid},
-                )
-                results.extend(result.chunks)
-            except Exception:
-                logger.exception("pinned_chunk_retrieve_failed", extra={"article_id": pid})
-
-        return results
+        try:
+            result = await self._retriever.retrieve(
+                message,
+                top_k=self._max_context_chunks,
+                min_score=self._min_score,
+                min_rerank_score=self._min_rerank_score,
+                filters={"public_article_id": public_article_ids},
+            )
+            return result.chunks
+        except Exception:
+            logger.exception("pinned_chunk_retrieve_failed", extra={"article_ids": public_article_ids})
+            return []
 
     def _collect_articles(
         self, chunks: list[ChunkResult]

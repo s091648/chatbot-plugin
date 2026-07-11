@@ -1,0 +1,37 @@
+name: Bump Version on Tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  bump-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set version from tag
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" pyproject.toml
+
+      - name: Commit version bump
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "chore: bump version to $VERSION [skip ci]"
+          git push origin HEAD:refs/heads/master
+
+      - name: Move tag to version bump commit
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          git tag -f "$TAG_NAME"
+          git push origin "refs/tags/$TAG_NAME" --force

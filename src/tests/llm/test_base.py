@@ -5,13 +5,18 @@ import pytest
 
 from chatbot_plugin_sdk import SlidingWindowStrategy, RateLimitExhausted
 
-from chatbot_plugin.llm.base import LLMProvider, ProviderHandler, ResilientLLMService
+from chatbot_plugin.llm.base import (
+    AllProvidersExhausted,
+    LLMProvider,
+    ProviderHandler,
+    ResilientLLMService,
+)
 
 
 def _mock_provider(name: str = "mock", model: str = "mock-model") -> AsyncMock:
     provider = AsyncMock(spec=LLMProvider)
     provider.model = model
-    provider.complete = AsyncMock(return_value="Generated text")
+    provider.complete = AsyncMock(return_value=(None, "Generated text"))
     return provider
 
 
@@ -37,7 +42,7 @@ class TestResilientLLMService:
         h2 = _handler(name="second", priority=2)
         service = ResilientLLMService([h2, h1])
         result = await service.complete([{"role": "user", "content": "hi"}], 100)
-        assert result == "Generated text"
+        assert result == (None, "Generated text")
         h1.provider.complete.assert_called_once()
         h2.provider.complete.assert_not_called()
 
@@ -48,7 +53,7 @@ class TestResilientLLMService:
         h2 = _handler(name="backup", priority=2)
         service = ResilientLLMService([h1, h2])
         result = await service.complete([{"role": "user", "content": "hi"}], 100)
-        assert result == "Generated text"
+        assert result == (None, "Generated text")
         h2.provider.complete.assert_called_once()
 
     @pytest.mark.asyncio
@@ -58,24 +63,24 @@ class TestResilientLLMService:
         h1.provider.complete = AsyncMock(side_effect=RateLimitExhausted("daily cap"))
         service = ResilientLLMService([h1, h2])
         result = await service.complete([{"role": "user", "content": "hi"}], 100)
-        assert result == "Generated text"
+        assert result == (None, "Generated text")
         assert service._handlers[0].name == "backup"
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_no_handlers(self):
+    async def test_raises_when_no_handlers(self):
         service = ResilientLLMService([])
-        result = await service.complete([{"role": "user", "content": "hi"}], 100)
-        assert result is None
+        with pytest.raises(AllProvidersExhausted):
+            await service.complete([{"role": "user", "content": "hi"}], 100)
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_all_handlers_fail(self):
+    async def test_raises_when_all_handlers_fail(self):
         h1 = _handler(name="h1", priority=1)
         h2 = _handler(name="h2", priority=2)
         h1.provider.complete = AsyncMock(side_effect=RuntimeError("down"))
         h2.provider.complete = AsyncMock(side_effect=RuntimeError("down"))
         service = ResilientLLMService([h1, h2])
-        result = await service.complete([{"role": "user", "content": "hi"}], 100)
-        assert result is None
+        with pytest.raises(AllProvidersExhausted):
+            await service.complete([{"role": "user", "content": "hi"}], 100)
 
 
 class TestProviderHandler:
@@ -85,7 +90,7 @@ class TestProviderHandler:
         result = await handler.complete(
             [{"role": "user", "content": "hello"}], 500
         )
-        assert result == "Generated text"
+        assert result == (None, "Generated text")
         handler.provider.complete.assert_called_once_with(
             [{"role": "user", "content": "hello"}], 500
         )

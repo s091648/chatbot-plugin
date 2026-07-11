@@ -206,7 +206,7 @@ class TestPinnedArticles:
             None,
         )
         assert pinned_call is not None
-        assert pinned_call.kwargs["filters"]["public_article_id"] == "pub-uuid-123"
+        assert pinned_call.kwargs["filters"]["public_article_id"] == ["pub-uuid-123"]
 
     @pytest.mark.asyncio
     async def test_pinned_uses_min_score_and_rerank_thresholds(self):
@@ -224,7 +224,8 @@ class TestPinnedArticles:
         assert pinned_call.kwargs["min_rerank_score"] == 0.7
 
     @pytest.mark.asyncio
-    async def test_multiple_pinned_articles_each_get_retrieve_call(self):
+    async def test_multiple_pinned_articles_single_batched_call(self):
+        """All pinned article ids are queried in a single batched retrieve call."""
         retriever = _mock_retriever()
         service = ChatService(retriever=retriever, llm=_mock_llm())
         await service.chat("q", pinned_article_ids=["id1", "id2", "id3"])
@@ -233,13 +234,12 @@ class TestPinnedArticles:
             c for c in retriever.retrieve.call_args_list
             if "public_article_id" in (c.kwargs.get("filters") or {})
         ]
-        assert len(pinned_calls) == 3
-        ids_queried = {c.kwargs["filters"]["public_article_id"] for c in pinned_calls}
-        assert ids_queried == {"id1", "id2", "id3"}
+        assert len(pinned_calls) == 1
+        assert pinned_calls[0].kwargs["filters"]["public_article_id"] == ["id1", "id2", "id3"]
 
     @pytest.mark.asyncio
-    async def test_multiple_pinned_articles_slot_allocation(self):
-        """Each article gets max_context_chunks // n_articles slots (minimum 3)."""
+    async def test_pinned_batch_call_uses_max_context_chunks_as_top_k(self):
+        """The batched pinned call requests up to max_context_chunks regardless of article count."""
         retriever = _mock_retriever()
         service = ChatService(retriever=retriever, llm=_mock_llm(), max_context_chunks=10)
         await service.chat("q", pinned_article_ids=["id1", "id2"])
@@ -248,22 +248,8 @@ class TestPinnedArticles:
             c for c in retriever.retrieve.call_args_list
             if "public_article_id" in (c.kwargs.get("filters") or {})
         ]
-        for call in pinned_calls:
-            assert call.kwargs["top_k"] == 5  # 10 // 2
-
-    @pytest.mark.asyncio
-    async def test_slot_allocation_minimum_three_per_article(self):
-        """With many articles the minimum is 3 chunks per article."""
-        retriever = _mock_retriever()
-        service = ChatService(retriever=retriever, llm=_mock_llm(), max_context_chunks=6)
-        await service.chat("q", pinned_article_ids=["id1", "id2", "id3", "id4"])
-
-        pinned_calls = [
-            c for c in retriever.retrieve.call_args_list
-            if "public_article_id" in (c.kwargs.get("filters") or {})
-        ]
-        for call in pinned_calls:
-            assert call.kwargs["top_k"] == 3  # max(6//4=1, 3) → 3
+        assert len(pinned_calls) == 1
+        assert pinned_calls[0].kwargs["top_k"] == 10
 
     @pytest.mark.asyncio
     async def test_pinned_chunks_deduplicated_with_semantic(self):

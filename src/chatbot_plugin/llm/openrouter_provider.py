@@ -38,5 +38,5 @@ class OpenRouterProvider:
             response.raise_for_status()
             data = response.json()
 
-        logger.info("openrouter_api_called", model=self.model)
+        logger.info("openrouter_api_called", extra={"model": self.model})
         return (None, data["choices"][0]["message"]["content"])

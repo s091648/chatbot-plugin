@@ -24,11 +24,11 @@ class TestClaudeProvider:
     async def test_complete_sends_messages(self):
         provider = ClaudeProvider(api_key="test-key", model="claude-sonnet-4-6-20250514")
         mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="RAG is retrieval-augmented generation.")]
+        mock_response.content = [MagicMock(type="text", text="RAG is retrieval-augmented generation.")]
         mock_response.usage = MagicMock(input_tokens=50, output_tokens=20)
         with patch.object(provider._client.messages, "create", new_callable=AsyncMock, return_value=mock_response) as mock_create:
             result = await provider.complete(MESSAGES, 1024)
-        assert result == "RAG is retrieval-augmented generation."
+        assert result == (None, "RAG is retrieval-augmented generation.")
         mock_create.assert_called_once()
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs["model"] == "claude-sonnet-4-6-20250514"
@@ -60,7 +60,7 @@ class TestGeminiProvider:
         mock_response.candidates = [MagicMock(finish_reason=finish_reason)]
         with patch.object(provider._client.models, "generate_content", return_value=mock_response) as mock_gen:
             result = await provider.complete(MESSAGES, 1024)
-        assert result == "RAG is a retrieval technique."
+        assert result == (None, "RAG is a retrieval technique.")
         mock_gen.assert_called_once()
 
     @pytest.mark.asyncio
@@ -73,7 +73,7 @@ class TestGeminiProvider:
         mock_response.text = ""
         with patch.object(provider._client.models, "generate_content", return_value=mock_response):
             result = await provider.complete(MESSAGES, 1024)
-        assert result == ""
+        assert result == (None, "")
 
     @pytest.mark.asyncio
     async def test_complete_raises_on_resource_exhausted(self):
@@ -104,4 +104,4 @@ class TestOpenRouterProvider:
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
             result = await provider.complete(MESSAGES, 1024)
-        assert result == "RAG combines retrieval with generation."
+        assert result == (None, "RAG combines retrieval with generation.")

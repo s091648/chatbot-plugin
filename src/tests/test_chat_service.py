@@ -174,6 +174,35 @@ class TestChatService:
         result = await _service(chunks=chunks).chat("q")
         assert len(result.chunks) == 2
 
+    @pytest.mark.asyncio
+    async def test_chat_filters_articles_to_only_those_cited_in_reply(self):
+        chunks = [
+            _chunk(chunk_id="c1", article_id="a1", title="Article 1"),
+            _chunk(chunk_id="c2", article_id="a2", title="Article 2"),
+            _chunk(chunk_id="c3", article_id="a3", title="Article 3"),
+        ]
+        result = await _service(chunks=chunks, reply="See [1] for details.").chat("q")
+        assert [a.id for a in result.articles_used] == ["a1"]
+
+    @pytest.mark.asyncio
+    async def test_chat_filters_articles_with_grouped_citation(self):
+        chunks = [
+            _chunk(chunk_id="c1", article_id="a1", title="Article 1"),
+            _chunk(chunk_id="c2", article_id="a2", title="Article 2"),
+            _chunk(chunk_id="c3", article_id="a3", title="Article 3"),
+        ]
+        result = await _service(chunks=chunks, reply="See [1, 3] for details.").chat("q")
+        assert [a.id for a in result.articles_used] == ["a1", "a3"]
+
+    @pytest.mark.asyncio
+    async def test_chat_returns_all_articles_when_reply_has_no_citations(self):
+        chunks = [
+            _chunk(chunk_id="c1", article_id="a1", title="Article 1"),
+            _chunk(chunk_id="c2", article_id="a2", title="Article 2"),
+        ]
+        result = await _service(chunks=chunks, reply="No citations here.").chat("q")
+        assert [a.id for a in result.articles_used] == ["a1", "a2"]
+
 
 # ── Pinned article behaviour ──────────────────────────────────────────────────
 

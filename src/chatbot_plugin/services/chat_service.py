@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 
 from chatbot_plugin_sdk.contracts.responses import ChunkResult
@@ -8,6 +9,11 @@ from chatbot_plugin.llm.base import ResilientLLMService
 from chatbot_plugin_sdk.processors.retrieve import RetrieveProcessor
 
 logger = logging.getLogger(__name__)
+
+# Matches inline citations the system prompt asks the model to produce, e.g. "[1]" or the
+# grouped form "[1, 2]" — used to work out which of the context articles were actually cited
+# so unused ones aren't sent back to the frontend as source pills.
+_CITATION_PATTERN = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 SYSTEM_PROMPT = """\
 You are a research assistant that answers questions based ONLY on the
@@ -96,7 +102,22 @@ class ChatService:
         ]
 
         thinking, reply = await self._llm.complete(messages, self._max_tokens)
-        return ChatResult(reply=reply, articles_used=articles, thinking=thinking, chunks=merged)
+        articles_used = self._filter_cited_articles(reply, articles)
+        return ChatResult(reply=reply, articles_used=articles_used, thinking=thinking, chunks=merged)
+
+    def _filter_cited_articles(self, reply: str, articles: list[ArticleRef]) -> list[ArticleRef]:
+        """Keeps only the context articles whose [N] index is actually cited in the reply.
+
+        Falls back to returning every context article when the reply has no citations at all
+        (e.g. the model ignored the instruction) — better to over-show sources than show none.
+        """
+        cited: set[int] = set()
+        for match in _CITATION_PATTERN.finditer(reply):
+            for part in match.group(1).split(","):
+                cited.add(int(part.strip()))
+        if not cited:
+            return articles
+        return [article for i, article in enumerate(articles, start=1) if i in cited]
 
     async def _fetch_pinned_chunks(self, message: str, public_article_ids: list[str]) -> list[ChunkResult]:
         if not public_article_ids:

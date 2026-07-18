@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from chatbot_plugin_sdk import SlidingWindowStrategy, RateLimitExhausted
@@ -13,6 +13,27 @@ class AllProvidersExhausted(Exception):
     """Raised when every LLM provider has failed or hit its rate limit."""
 
 
+@dataclass
+class ToolSpec:
+    name: str
+    description: str
+    input_schema: dict
+
+
+@dataclass
+class ToolCallRequest:
+    id: str
+    name: str
+    arguments: dict
+
+
+@dataclass
+class LLMResult:
+    thinking: str | None
+    text: str
+    tool_calls: list[ToolCallRequest] = field(default_factory=list)
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     model: str
@@ -21,11 +42,13 @@ class LLMProvider(Protocol):
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> tuple[str | None, str]:
-        """Send messages array, return (thinking, reply) tuple.
+        tools: list[ToolSpec] | None = None,
+    ) -> LLMResult:
+        """Send messages array (+ optional tool definitions), return an LLMResult.
 
-        thinking is None for providers that don't support extended thinking.
-        messages format: [{"role": "system"|"user", "content": "..."}]
+        messages format: [{"role": "system"|"user"|"assistant"|"tool", "content": "...", ...}]
+        Tool-call turn: {"role": "assistant", "content": "", "tool_calls": [{"id","name","arguments"}]}
+        Tool-result turn: {"role": "tool", "tool_call_id": str, "name": str, "content": str, "is_error": bool}
         """
         ...
 
@@ -41,10 +64,11 @@ class ProviderHandler:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> tuple[str | None, str]:
+        tools: list[ToolSpec] | None = None,
+    ) -> LLMResult:
         estimated_tokens = sum(len(m.get("content", "")) // 4 for m in messages)
         await self.strategy.acquire(estimated_tokens=estimated_tokens)
-        result = await self.provider.complete(messages, max_tokens)
+        result = await self.provider.complete(messages, max_tokens, tools)
         self.strategy.record_usage(estimated_tokens)
         return result
 
@@ -59,18 +83,30 @@ class ResilientLLMService:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> tuple[str | None, str]:
-        if not self._handlers:
+        tools: list["ToolSpec"] | None = None,
+        pinned_handler: ProviderHandler | None = None,
+        exclude: set[str] | None = None,
+    ) -> tuple[LLMResult, ProviderHandler]:
+        if pinned_handler is not None:
+            try:
+                result = await pinned_handler.complete(messages, max_tokens, tools)
+            except Exception as e:
+                logger.error(
+                    "pinned_provider_failed",
+                    extra={"provider": pinned_handler.name, "error": str(e)},
+                )
+                raise AllProvidersExhausted() from e
+            return (result, pinned_handler)
+
+        excluded = exclude or set()
+        candidates = [h for h in self._handlers if h.name not in excluded]
+        if not candidates:
             raise AllProvidersExhausted()
 
-        handlers_snapshot = list(self._handlers)
-
-        for handler in handlers_snapshot:
+        for handler in list(candidates):
             try:
-                thinking, reply = await handler.complete(messages, max_tokens)
-                if reply is not None:
-                    return (thinking, reply)
-                logger.warning("provider_returned_none", extra={"provider": handler.name})
+                result = await handler.complete(messages, max_tokens, tools)
+                return (result, handler)
             except RateLimitExhausted:
                 logger.warning("provider_daily_limit_reached", extra={"provider": handler.name})
                 self._handlers.remove(handler)

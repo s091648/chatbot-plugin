@@ -5,6 +5,7 @@ import pytest
 
 from chatbot_plugin_sdk.contracts.responses import ChunkResult, SearchResponse
 from chatbot_plugin.services.chat_service import ChatService, ArticleRef, SYSTEM_PROMPT
+from chatbot_plugin.llm.base import AllProvidersExhausted, LLMResult, ProviderHandler, ToolCallRequest
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -51,10 +52,14 @@ def _mock_retriever(chunks=None, pinned_chunks=None):
     return retriever
 
 
+def _fake_handler(name: str = "mock") -> ProviderHandler:
+    return ProviderHandler(provider=AsyncMock(), strategy=AsyncMock(), priority=1, name=name)
+
+
 def _mock_llm(reply="Generated reply", thinking=None):
-    """LLM mock that returns (thinking, reply) matching ResilientLLMService.complete()."""
+    """LLM mock that returns (LLMResult, ProviderHandler) matching ResilientLLMService.complete()."""
     llm = MagicMock()
-    llm.complete = AsyncMock(return_value=(thinking, reply))
+    llm.complete = AsyncMock(return_value=(LLMResult(thinking=thinking, text=reply), _fake_handler()))
     return llm
 
 
@@ -208,22 +213,6 @@ class TestChatService:
 
 class TestPinnedArticles:
     @pytest.mark.asyncio
-    async def test_pinned_article_chunks_prepended_before_semantic(self):
-        """Chunks from pinned article appear first in the merged list."""
-        semantic_chunks = [_chunk(chunk_id="sem1", article_id="a-semantic", title="Semantic")]
-        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
-
-        llm = _mock_llm()
-        service = ChatService(
-            retriever=_mock_retriever(chunks=semantic_chunks, pinned_chunks=pinned_chunks),
-            llm=llm,
-        )
-        result = await service.chat("question", pinned_article_ids=["pub-uuid"])
-        # Pinned chunk should be first
-        assert result.chunks[0].chunk_id == "pin1"
-        assert result.chunks[1].chunk_id == "sem1"
-
-    @pytest.mark.asyncio
     async def test_pinned_retrieval_uses_public_article_id_filter(self):
         retriever = _mock_retriever()
         service = ChatService(retriever=retriever, llm=_mock_llm())
@@ -281,33 +270,13 @@ class TestPinnedArticles:
         assert pinned_calls[0].kwargs["top_k"] == 10
 
     @pytest.mark.asyncio
-    async def test_pinned_chunks_deduplicated_with_semantic(self):
-        """A chunk returned by both pinned and semantic retrieval appears only once."""
-        shared = _chunk(chunk_id="shared", article_id="a1")
-        semantic = _chunk(chunk_id="unique-sem", article_id="a2")
-
-        async def _retrieve(query, top_k=10, min_score=0.0, min_rerank_score=0.0, filters=None):
-            if filters and "public_article_id" in filters:
-                return SearchResponse(chunks=[shared])
-            return SearchResponse(chunks=[shared, semantic])
-
-        retriever = MagicMock()
-        retriever.retrieve = AsyncMock(side_effect=_retrieve)
-        service = ChatService(retriever=retriever, llm=_mock_llm())
-        result = await service.chat("q", pinned_article_ids=["pub"])
-
-        chunk_ids = [c.chunk_id for c in result.chunks]
-        assert chunk_ids.count("shared") == 1
-
-    @pytest.mark.asyncio
     async def test_pinned_retrieve_failure_is_graceful(self):
         """A retrieval error for a pinned article does not crash the whole request."""
-        semantic_chunks = [_chunk(chunk_id="sem1")]
 
         async def _retrieve(query, top_k=10, min_score=0.0, min_rerank_score=0.0, filters=None):
             if filters and "public_article_id" in filters:
                 raise RuntimeError("vector service unavailable")
-            return SearchResponse(chunks=semantic_chunks)
+            return SearchResponse(chunks=[])
 
         retriever = MagicMock()
         retriever.retrieve = AsyncMock(side_effect=_retrieve)
@@ -315,7 +284,6 @@ class TestPinnedArticles:
         result = await service.chat("q", pinned_article_ids=["bad-id"])
 
         assert result.reply == "Generated reply"
-        assert any(c.chunk_id == "sem1" for c in result.chunks)
 
     @pytest.mark.asyncio
     async def test_no_pinned_ids_does_not_call_retrieve_with_filter(self):
@@ -362,6 +330,104 @@ class TestPinnedArticles:
         result = await service.chat("q", pinned_article_ids=["pub"])
         assert result.reply == "Generated reply"
         assert len(result.chunks) == 1
+
+
+# ── Pinned tool-calling agent loop ─────────────────────────────────────────────
+
+class TestPinnedToolCalling:
+    @pytest.mark.asyncio
+    async def test_no_tool_call_when_pinned_context_sufficient(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        service = _service(
+            pinned_chunks=pinned_chunks,
+            reply="Generated reply",  # mock LLM never requests a tool by default
+        )
+        result = await service.chat("what is this about", pinned_article_ids=["pub"])
+        assert result.tool_calls_executed == []
+        assert result.reply == "Generated reply"
+
+    @pytest.mark.asyncio
+    async def test_tool_called_when_pinned_context_insufficient(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        searched_chunks = [_chunk(chunk_id="s1", article_id="a-searched", title="Searched")]
+
+        llm = AsyncMock()
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "broader topic"})
+        llm.complete = AsyncMock(side_effect=[
+            (LLMResult(thinking=None, text="", tool_calls=[tool_call]), _fake_handler()),
+            (LLMResult(thinking=None, text="Final answer citing [2]"), _fake_handler()),
+        ])
+
+        retriever = _mock_retriever(chunks=searched_chunks, pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7)
+
+        result = await service.chat("broad question", pinned_article_ids=["pub"])
+
+        assert len(result.tool_calls_executed) == 1
+        assert result.tool_calls_executed[0].name == "search_articles"
+        assert result.tool_calls_executed[0].is_error is False
+        assert result.reply == "Final answer citing [2]"
+
+        # search call must NOT filter by public_article_id (full corpus)
+        search_calls = [c for c in retriever.retrieve.call_args_list if c.kwargs.get("filters") is None]
+        assert len(search_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_tool_execution_failure_still_produces_final_answer(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"})
+
+        llm = AsyncMock()
+        llm.complete = AsyncMock(side_effect=[
+            (LLMResult(thinking=None, text="", tool_calls=[tool_call]), _fake_handler()),
+            (LLMResult(thinking=None, text="Sorry, I could not find more info"), _fake_handler()),
+        ])
+
+        retriever = AsyncMock()
+        async def retrieve_side_effect(*args, **kwargs):
+            if kwargs.get("filters") is None:
+                raise RuntimeError("search backend down")
+            return SearchResponse(chunks=pinned_chunks)
+        retriever.retrieve = AsyncMock(side_effect=retrieve_side_effect)
+
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7)
+        result = await service.chat("question", pinned_article_ids=["pub"])
+
+        assert result.tool_calls_executed[0].is_error is True
+        assert result.reply == "Sorry, I could not find more info"
+
+    @pytest.mark.asyncio
+    async def test_provider_failure_mid_exchange_restarts_with_next_provider(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"})
+        failing_handler = _fake_handler(name="failing")
+        backup_handler = _fake_handler(name="backup")
+
+        llm = AsyncMock()
+        llm.complete = AsyncMock(side_effect=[
+            (LLMResult(thinking=None, text="", tool_calls=[tool_call]), failing_handler),  # round 1, attempt 1
+            AllProvidersExhausted(),  # round 2, attempt 1 (pinned to failing_handler) -> fails
+            (LLMResult(thinking=None, text="", tool_calls=[tool_call]), backup_handler),  # round 1, attempt 2
+            (LLMResult(thinking=None, text="Final answer"), backup_handler),  # round 2, attempt 2 -> succeeds
+        ])
+
+        retriever = _mock_retriever(chunks=[], pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7)
+        result = await service.chat("question", pinned_article_ids=["pub"])
+
+        assert result.reply == "Final answer"
+        assert llm.complete.call_count == 4
+        # second attempt's first call must exclude the failed handler
+        second_attempt_call = llm.complete.call_args_list[2]
+        assert second_attempt_call.kwargs["exclude"] == {"failing"}
+
+    @pytest.mark.asyncio
+    async def test_non_pinned_requests_unaffected(self):
+        semantic_chunks = [_chunk(chunk_id="s1", article_id="a1")]
+        service = _service(chunks=semantic_chunks, reply="Normal reply")
+        result = await service.chat("question", pinned_article_ids=None)
+        assert result.tool_calls_executed == []
+        assert result.reply == "Normal reply"
 
 
 # ── Context assembly ──────────────────────────────────────────────────────────

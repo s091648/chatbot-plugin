@@ -186,9 +186,7 @@ class TestOpenRouterProvider:
     async def test_complete_sends_messages(self):
         provider = OpenRouterProvider(api_key="test-key", model="meta-llama/llama-3-70b")
         mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "choices": [{"message": {"content": "RAG combines retrieval with generation."}}],
-        }
+        mock_response.json.return_value = {"choices": [{"message": {"content": "RAG combines retrieval with generation."}}]}
         mock_response.raise_for_status = MagicMock()
         with patch("chatbot_plugin.llm.openrouter_provider.httpx.AsyncClient") as mock_client_cls:
             mock_client = AsyncMock()
@@ -197,3 +195,59 @@ class TestOpenRouterProvider:
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
             result = await provider.complete(MESSAGES, 1024)
         assert result.text == "RAG combines retrieval with generation."
+
+    @pytest.mark.asyncio
+    async def test_complete_sends_tools_when_provided(self):
+        provider = OpenRouterProvider(api_key="test-key", model="meta-llama/llama-3-70b")
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_response.raise_for_status = MagicMock()
+        tools = [ToolSpec(name="search_articles", description="search", input_schema={"type": "object"})]
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            await provider.complete(MESSAGES, 1024, tools=tools)
+        sent_payload = mock_client.post.call_args.kwargs["json"]
+        assert sent_payload["tools"] == [{"type": "function", "function": {"name": "search_articles", "description": "search", "parameters": {"type": "object"}}}]
+
+    @pytest.mark.asyncio
+    async def test_complete_parses_tool_calls_response(self):
+        provider = OpenRouterProvider(api_key="test-key", model="meta-llama/llama-3-70b")
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "call_1", "function": {"name": "search_articles", "arguments": '{"query": "foo"}'}}
+            ]}}]
+        }
+        mock_response.raise_for_status = MagicMock()
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            result = await provider.complete(MESSAGES, 1024)
+        assert result.tool_calls == [ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "foo"})]
+        assert result.text == ""
+
+    @pytest.mark.asyncio
+    async def test_complete_translates_tool_round_trip_messages(self):
+        provider = OpenRouterProvider(api_key="test-key", model="meta-llama/llama-3-70b")
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"choices": [{"message": {"content": "final answer"}}]}
+        mock_response.raise_for_status = MagicMock()
+        round_trip_messages = [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "name": "search_articles", "arguments": {"query": "foo"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "name": "search_articles", "content": "[1] Title\nchunk text", "is_error": False},
+        ]
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            await provider.complete(round_trip_messages, 100)
+        sent_messages = mock_client.post.call_args.kwargs["json"]["messages"]
+        assert sent_messages[1]["tool_calls"][0]["function"]["arguments"] == '{"query": "foo"}'
+        assert sent_messages[2] == {"role": "tool", "tool_call_id": "call_1", "content": "[1] Title\nchunk text"}

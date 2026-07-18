@@ -123,6 +123,59 @@ class TestGeminiProvider:
             with pytest.raises(RateLimitExhausted):
                 await provider.complete(MESSAGES, 1024)
 
+    @pytest.mark.asyncio
+    async def test_complete_sends_tools_when_provided(self):
+        provider = GeminiProvider(api_key="test-key")
+        mock_response = MagicMock()
+        mock_response.text = "ok"
+        finish_reason = MagicMock()
+        finish_reason.name = "STOP"
+        mock_response.candidates = [MagicMock(finish_reason=finish_reason)]
+        tools = [ToolSpec(name="search_articles", description="search", input_schema={"type": "object"})]
+        with patch.object(provider._client.models, "generate_content", return_value=mock_response) as mock_gen:
+            await provider.complete(MESSAGES, 100, tools=tools)
+        config = mock_gen.call_args.kwargs["config"]
+        assert config.tools is not None
+
+    @pytest.mark.asyncio
+    async def test_complete_parses_function_call_part(self):
+        provider = GeminiProvider(api_key="test-key")
+        fc_part = MagicMock(text=None, thought=False)
+        fc_mock = MagicMock(args={"query": "foo"})
+        fc_mock.name = "search_articles"  # MagicMock(name=...) is reserved for repr, not an attribute
+        fc_part.function_call = fc_mock
+        finish_reason = MagicMock()
+        finish_reason.name = "STOP"
+        mock_response = MagicMock()
+        mock_response.candidates = [MagicMock(finish_reason=finish_reason, content=MagicMock(parts=[fc_part]))]
+        with patch.object(provider._client.models, "generate_content", return_value=mock_response):
+            result = await provider.complete(MESSAGES, 100, tools=[ToolSpec("search_articles", "d", {})])
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0].name == "search_articles"
+        assert result.tool_calls[0].arguments == {"query": "foo"}
+
+    @pytest.mark.asyncio
+    async def test_complete_translates_tool_round_trip_messages(self):
+        provider = GeminiProvider(api_key="test-key")
+        mock_response = MagicMock()
+        mock_response.text = "final answer"
+        finish_reason = MagicMock()
+        finish_reason.name = "STOP"
+        mock_response.candidates = [MagicMock(finish_reason=finish_reason)]
+        round_trip_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_0", "name": "search_articles", "arguments": {"query": "foo"}}]},
+            {"role": "tool", "tool_call_id": "call_0", "name": "search_articles", "content": "[1] Title\nchunk text", "is_error": False},
+        ]
+        with patch.object(provider._client.models, "generate_content", return_value=mock_response) as mock_gen:
+            await provider.complete(round_trip_messages, 100)
+        contents = mock_gen.call_args.kwargs["contents"]
+        assert contents[1].role == "model"
+        assert contents[1].parts[0].function_call.name == "search_articles"
+        assert contents[2].role == "user"
+        assert contents[2].parts[0].function_response.name == "search_articles"
+
 
 class TestOpenRouterProvider:
     def test_satisfies_protocol(self):

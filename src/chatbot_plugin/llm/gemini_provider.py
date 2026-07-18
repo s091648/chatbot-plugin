@@ -6,8 +6,7 @@ import logging
 from google import genai
 
 from chatbot_plugin_sdk import RateLimitExhausted
-
-from chatbot_plugin.llm.base import LLMResult
+from chatbot_plugin.llm.base import LLMResult, ToolCallRequest, ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -23,16 +22,25 @@ class GeminiProvider:
         self,
         messages: list[dict],
         max_tokens: int,
+        tools: list[ToolSpec] | None = None,
     ) -> LLMResult:
-        parts = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                parts.append(f"[System Instructions]\n{content}")
-            else:
-                parts.append(content)
-        contents = "\n\n".join(parts)
+        system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+        system_instruction = "\n\n".join(system_parts) or None
+        contents = [self._to_gemini_content(m) for m in messages if m.get("role") != "system"]
+
+        config_kwargs: dict = {
+            "max_output_tokens": max_tokens,
+            "automatic_function_calling": genai.types.AutomaticFunctionCallingConfig(disable=True),
+        }
+        if system_instruction:
+            config_kwargs["system_instruction"] = system_instruction
+        if tools:
+            config_kwargs["tools"] = [
+                genai.types.Tool(function_declarations=[
+                    genai.types.FunctionDeclaration(name=t.name, description=t.description, parameters=t.input_schema)
+                    for t in tools
+                ])
+            ]
 
         try:
             response = await asyncio.get_running_loop().run_in_executor(
@@ -40,12 +48,7 @@ class GeminiProvider:
                 lambda: self._client.models.generate_content(
                     model=self.model,
                     contents=contents,
-                    config=genai.types.GenerateContentConfig(
-                        max_output_tokens=max_tokens,
-                        automatic_function_calling=genai.types.AutomaticFunctionCallingConfig(
-                            disable=True,
-                        ),
-                    ),
+                    config=genai.types.GenerateContentConfig(**config_kwargs),
                 ),
             )
         except Exception as e:
@@ -55,7 +58,7 @@ class GeminiProvider:
             raise
 
         if not response.candidates:
-            return LLMResult(thinking=None, text="", tool_calls=[])
+            return LLMResult(thinking=None, text="")
 
         candidate = response.candidates[0]
         fr = candidate.finish_reason
@@ -63,15 +66,18 @@ class GeminiProvider:
         if fr_name not in ("STOP", "1"):
             logger.warning("gemini_blocked", extra={"model": self.model, "finish_reason": fr_name})
             if fr_name != "MAX_TOKENS":
-                return LLMResult(thinking=None, text="", tool_calls=[])
+                return LLMResult(thinking=None, text="")
 
-        # Separate thinking parts (thought=True) from reply parts (thought=False).
-        # Non-thinking models only have reply parts; response.text is a safe fallback.
         content_parts = candidate.content.parts if candidate.content else []
         thinking_chunks: list[str] = []
         reply_chunks: list[str] = []
+        tool_calls: list[ToolCallRequest] = []
 
-        for p in content_parts:
+        for i, p in enumerate(content_parts):
+            fc = getattr(p, "function_call", None)
+            if fc is not None:
+                tool_calls.append(ToolCallRequest(id=f"call_{i}", name=fc.name, arguments=dict(fc.args or {})))
+                continue
             text = getattr(p, "text", None)
             if not text:
                 continue
@@ -80,8 +86,7 @@ class GeminiProvider:
             else:
                 reply_chunks.append(text)
 
-        # Fallback for non-thinking models where parts may be empty
-        if not reply_chunks and not thinking_chunks:
+        if not reply_chunks and not thinking_chunks and not tool_calls:
             reply_chunks.append(response.text or "")
 
         thinking = "".join(thinking_chunks).strip() or None
@@ -94,6 +99,27 @@ class GeminiProvider:
                 "finish_reason": fr_name,
                 "reply_len": len(reply),
                 "has_thinking": thinking is not None,
+                "tool_call_count": len(tool_calls),
             },
         )
-        return LLMResult(thinking=thinking, text=reply, tool_calls=[])
+        return LLMResult(thinking=thinking, text=reply, tool_calls=tool_calls)
+
+    @staticmethod
+    def _to_gemini_content(message: dict):
+        role = message["role"]
+        if role == "assistant" and message.get("tool_calls"):
+            parts = [
+                genai.types.Part(function_call=genai.types.FunctionCall(name=tc["name"], args=tc["arguments"]))
+                for tc in message["tool_calls"]
+            ]
+            return genai.types.Content(role="model", parts=parts)
+        if role == "tool":
+            payload = {"error": message["content"]} if message.get("is_error") else {"result": message["content"]}
+            return genai.types.Content(
+                role="user",
+                parts=[genai.types.Part(function_response=genai.types.FunctionResponse(
+                    name=message["name"], response=payload,
+                ))],
+            )
+        gemini_role = "model" if role == "assistant" else "user"
+        return genai.types.Content(role=gemini_role, parts=[genai.types.Part(text=message["content"])])

@@ -52,11 +52,28 @@ class OpenRouterProvider:
             ToolCallRequest(
                 id=tc["id"],
                 name=tc["function"]["name"],
-                arguments=json.loads(tc["function"]["arguments"]) if tc["function"].get("arguments") else {},
+                arguments=self._parse_tool_arguments(tc["function"].get("arguments")),
             )
             for tc in message.get("tool_calls") or []
         ]
         return LLMResult(thinking=None, text=message.get("content") or "", tool_calls=tool_calls)
+
+    @staticmethod
+    def _parse_tool_arguments(raw_arguments: str | None) -> dict:
+        """Parse a tool call's JSON arguments string, degrading gracefully on malformed JSON.
+
+        Claude/Gemini SDKs hand back pre-parsed dicts, so only OpenRouter's raw JSON
+        string is exposed to this failure mode. Falling back to {} here routes into
+        ChatService._execute_tool_calls' existing "missing 'query' argument" handling
+        instead of crashing the call.
+        """
+        if not raw_arguments:
+            return {}
+        try:
+            return json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            logger.warning("openrouter_malformed_tool_arguments", extra={"raw_arguments": raw_arguments})
+            return {}
 
     @staticmethod
     def _to_openrouter_message(message: dict) -> dict:

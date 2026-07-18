@@ -31,7 +31,6 @@ class ClaudeProvider:
         kwargs: dict = {
             "model": self.model,
             "max_tokens": max_tokens,
-            "thinking": {"type": "enabled", "budget_tokens": _THINKING_BUDGET},
             "messages": claude_messages,
         }
         if system:
@@ -41,6 +40,13 @@ class ClaudeProvider:
                 {"name": t.name, "description": t.description, "input_schema": t.input_schema}
                 for t in tools
             ]
+        else:
+            # Extended thinking requires the original signed thinking block(s) to be
+            # carried forward on any tool-call round-trip continuation. This provider's
+            # round-trip reconstruction (_to_claude_message) does not thread those
+            # through, so thinking is disabled whenever tools are offered to avoid the
+            # API rejecting the request with a 400.
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": _THINKING_BUDGET}
 
         response = await self._client.messages.create(**kwargs)
         logger.info(

@@ -36,6 +36,7 @@ class TestClaudeProvider:
         assert len(call_kwargs["messages"]) == 1
         assert call_kwargs["messages"][0]["role"] == "user"
         assert "tools" not in call_kwargs
+        assert "thinking" in call_kwargs
 
     @pytest.mark.asyncio
     async def test_complete_sends_tools_when_provided(self):
@@ -48,6 +49,21 @@ class TestClaudeProvider:
             await provider.complete(MESSAGES, 100, tools=tools)
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs["tools"] == [{"name": "search_articles", "description": "search", "input_schema": {"type": "object"}}]
+
+    @pytest.mark.asyncio
+    async def test_complete_disables_thinking_when_tools_provided(self):
+        """Extended thinking + tools is rejected by the real API unless the original signed
+        thinking block is threaded through the tool-call round-trip, which this provider's
+        round-trip reconstruction does not do. Thinking must be omitted whenever tools are sent."""
+        provider = ClaudeProvider(api_key="test-key")
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(type="text", text="ok")]
+        mock_response.usage = MagicMock(input_tokens=0, output_tokens=0)
+        tools = [ToolSpec(name="search_articles", description="search", input_schema={"type": "object"})]
+        with patch.object(provider._client.messages, "create", new_callable=AsyncMock, return_value=mock_response) as mock_create:
+            await provider.complete(MESSAGES, 100, tools=tools)
+        call_kwargs = mock_create.call_args.kwargs
+        assert "thinking" not in call_kwargs
 
     @pytest.mark.asyncio
     async def test_complete_parses_tool_use_block(self):
@@ -230,6 +246,26 @@ class TestOpenRouterProvider:
             result = await provider.complete(MESSAGES, 1024)
         assert result.tool_calls == [ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "foo"})]
         assert result.text == ""
+
+    @pytest.mark.asyncio
+    async def test_complete_handles_malformed_tool_call_json_gracefully(self):
+        """Malformed JSON in a tool call's arguments must not crash complete() — it should
+        fall back to an empty dict so ChatService's existing missing-argument handling kicks in."""
+        provider = OpenRouterProvider(api_key="test-key", model="meta-llama/llama-3-70b")
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": None, "tool_calls": [
+                {"id": "call_1", "function": {"name": "search_articles", "arguments": '{"query": "foo"'}}
+            ]}}]
+        }
+        mock_response.raise_for_status = MagicMock()
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            result = await provider.complete(MESSAGES, 1024)
+        assert result.tool_calls[0].arguments == {}
 
     @pytest.mark.asyncio
     async def test_complete_translates_tool_round_trip_messages(self):

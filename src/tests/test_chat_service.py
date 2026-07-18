@@ -271,12 +271,14 @@ class TestPinnedArticles:
 
     @pytest.mark.asyncio
     async def test_pinned_retrieve_failure_is_graceful(self):
-        """A retrieval error for a pinned article does not crash the whole request."""
+        """A retrieval error for a pinned article does not crash the whole request, and must
+        not silently fall back to unrelated full-corpus search results."""
+        semantic_chunks = [_chunk(chunk_id="semantic1", article_id="a-semantic", title="Unrelated")]
 
         async def _retrieve(query, top_k=10, min_score=0.0, min_rerank_score=0.0, filters=None):
             if filters and "public_article_id" in filters:
                 raise RuntimeError("vector service unavailable")
-            return SearchResponse(chunks=[])
+            return SearchResponse(chunks=semantic_chunks)
 
         retriever = MagicMock()
         retriever.retrieve = AsyncMock(side_effect=_retrieve)
@@ -284,6 +286,7 @@ class TestPinnedArticles:
         result = await service.chat("q", pinned_article_ids=["bad-id"])
 
         assert result.reply == "Generated reply"
+        assert result.chunks == []
 
     @pytest.mark.asyncio
     async def test_no_pinned_ids_does_not_call_retrieve_with_filter(self):

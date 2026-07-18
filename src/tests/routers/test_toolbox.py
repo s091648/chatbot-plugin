@@ -199,3 +199,23 @@ class TestStreamingResponse:
                 l.startswith("data: ") and "thinking" in l for l in resp.text.splitlines()
             )
             assert not has_thinking
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_tool_call_frames_when_tools_executed(self, client: AsyncClient):
+        from chatbot_plugin.services.chat_service import ToolCallExecution
+        with patch.object(ChatService, "chat", new_callable=AsyncMock) as mock:
+            mock.return_value = ChatResult(
+                reply="Final answer [1]",
+                articles_used=[ArticleRef(id="a1", title="T", url="http://x", public_article_id="pub1")],
+                chunks=[],
+                tool_calls_executed=[
+                    ToolCallExecution(id="call_1", name="search_articles", arguments={"query": "foo"}, result_summary="[1] T\ntext", is_error=False),
+                ],
+            )
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={"messages": [{"role": "user", "content": "question"}], "stream": True, "pinned_article_ids": ["pub1"]},
+            )
+            body = resp.text
+            assert '"tool_calls":[{"id":"call_1"' in body.replace(" ", "")
+            assert '"tool_result":{"tool_call_id":"call_1"' in body.replace(" ", "")

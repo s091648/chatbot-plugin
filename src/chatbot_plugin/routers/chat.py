@@ -66,6 +66,32 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 thinking_payload = {"thinking": result.thinking}
                 yield f"data: {json.dumps(thinking_payload)}\n\n".encode()
 
+            if result.tool_calls_executed:
+                for call in result.tool_calls_executed:
+                    tool_call_chunk = {
+                        "id": cid, "object": "chat.completion.chunk",
+                        "created": ts, "model": req.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"tool_calls": [{
+                                "id": call.id,
+                                "type": "function",
+                                "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+                            }]},
+                            "finish_reason": None,
+                        }],
+                    }
+                    yield f"data: {json.dumps(tool_call_chunk)}\n\n".encode()
+
+                    tool_result_payload = {
+                        "tool_result": {
+                            "tool_call_id": call.id,
+                            "content": call.result_summary,
+                            "is_error": call.is_error,
+                        }
+                    }
+                    yield f"data: {json.dumps(tool_result_payload)}\n\n".encode()
+
             content_chunk = {
                 "id": cid, "object": "chat.completion.chunk",
                 "created": ts, "model": req.model,

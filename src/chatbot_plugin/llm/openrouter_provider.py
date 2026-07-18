@@ -4,6 +4,8 @@ import logging
 
 import httpx
 
+from chatbot_plugin.llm.base import LLMResult
+
 logger = logging.getLogger(__name__)
 
 _API_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -20,7 +22,7 @@ class OpenRouterProvider:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> tuple[str | None, str]:
+    ) -> LLMResult:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 _API_URL,
@@ -39,4 +41,4 @@ class OpenRouterProvider:
             data = response.json()
 
         logger.info("openrouter_api_called", extra={"model": self.model})
-        return (None, data["choices"][0]["message"]["content"])
+        return LLMResult(thinking=None, text=data["choices"][0]["message"]["content"], tool_calls=[])

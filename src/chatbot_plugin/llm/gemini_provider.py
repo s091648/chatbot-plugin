@@ -7,6 +7,8 @@ from google import genai
 
 from chatbot_plugin_sdk import RateLimitExhausted
 
+from chatbot_plugin.llm.base import LLMResult
+
 logger = logging.getLogger(__name__)
 
 
@@ -21,7 +23,7 @@ class GeminiProvider:
         self,
         messages: list[dict],
         max_tokens: int,
-    ) -> tuple[str | None, str]:
+    ) -> LLMResult:
         parts = []
         for msg in messages:
             role = msg.get("role", "user")
@@ -53,7 +55,7 @@ class GeminiProvider:
             raise
 
         if not response.candidates:
-            return (None, "")
+            return LLMResult(thinking=None, text="", tool_calls=[])
 
         candidate = response.candidates[0]
         fr = candidate.finish_reason
@@ -61,7 +63,7 @@ class GeminiProvider:
         if fr_name not in ("STOP", "1"):
             logger.warning("gemini_blocked", extra={"model": self.model, "finish_reason": fr_name})
             if fr_name != "MAX_TOKENS":
-                return (None, "")
+                return LLMResult(thinking=None, text="", tool_calls=[])
 
         # Separate thinking parts (thought=True) from reply parts (thought=False).
         # Non-thinking models only have reply parts; response.text is a safe fallback.
@@ -94,4 +96,4 @@ class GeminiProvider:
                 "has_thinking": thinking is not None,
             },
         )
-        return (thinking, reply)
+        return LLMResult(thinking=thinking, text=reply, tool_calls=[])

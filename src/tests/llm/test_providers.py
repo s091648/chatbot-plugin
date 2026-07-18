@@ -3,7 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chatbot_plugin.llm.base import LLMProvider
+from chatbot_plugin.llm.base import LLMProvider, ToolCallRequest, ToolSpec
 from chatbot_plugin.llm.claude_provider import ClaudeProvider
 from chatbot_plugin.llm.gemini_provider import GeminiProvider
 from chatbot_plugin.llm.openrouter_provider import OpenRouterProvider
@@ -21,28 +21,67 @@ class TestClaudeProvider:
         assert isinstance(provider, LLMProvider)
 
     @pytest.mark.asyncio
-    async def test_complete_sends_messages(self):
+    async def test_complete_sends_system_separately(self):
         provider = ClaudeProvider(api_key="test-key", model="claude-sonnet-4-6-20250514")
         mock_response = MagicMock()
         mock_response.content = [MagicMock(type="text", text="RAG is retrieval-augmented generation.")]
         mock_response.usage = MagicMock(input_tokens=50, output_tokens=20)
         with patch.object(provider._client.messages, "create", new_callable=AsyncMock, return_value=mock_response) as mock_create:
             result = await provider.complete(MESSAGES, 1024)
-        assert result == (None, "RAG is retrieval-augmented generation.")
-        mock_create.assert_called_once()
+        assert result.text == "RAG is retrieval-augmented generation."
         call_kwargs = mock_create.call_args.kwargs
         assert call_kwargs["model"] == "claude-sonnet-4-6-20250514"
         assert call_kwargs["max_tokens"] == 1024
-        assert len(call_kwargs["messages"]) == 2
+        assert call_kwargs["system"] == "You are helpful."
+        assert len(call_kwargs["messages"]) == 1
+        assert call_kwargs["messages"][0]["role"] == "user"
+        assert "tools" not in call_kwargs
 
     @pytest.mark.asyncio
-    async def test_complete_converts_roles(self):
-        provider = ClaudeProvider(api_key="test-key", model="claude-sonnet-4-6-20250514")
+    async def test_complete_sends_tools_when_provided(self):
+        provider = ClaudeProvider(api_key="test-key")
         mock_response = MagicMock()
-        mock_response.content = [MagicMock(text="ok")]
+        mock_response.content = [MagicMock(type="text", text="ok")]
+        mock_response.usage = MagicMock(input_tokens=0, output_tokens=0)
+        tools = [ToolSpec(name="search_articles", description="search", input_schema={"type": "object"})]
+        with patch.object(provider._client.messages, "create", new_callable=AsyncMock, return_value=mock_response) as mock_create:
+            await provider.complete(MESSAGES, 100, tools=tools)
+        call_kwargs = mock_create.call_args.kwargs
+        assert call_kwargs["tools"] == [{"name": "search_articles", "description": "search", "input_schema": {"type": "object"}}]
+
+    @pytest.mark.asyncio
+    async def test_complete_parses_tool_use_block(self):
+        provider = ClaudeProvider(api_key="test-key")
+        tool_block = MagicMock(type="tool_use", id="toolu_1", input={"query": "foo"})
+        tool_block.name = "search_articles"
+        mock_response = MagicMock()
+        mock_response.content = [tool_block]
         mock_response.usage = MagicMock(input_tokens=0, output_tokens=0)
         with patch.object(provider._client.messages, "create", new_callable=AsyncMock, return_value=mock_response):
-            await provider.complete(MESSAGES, 100)
+            result = await provider.complete(MESSAGES, 100, tools=[ToolSpec("search_articles", "d", {})])
+        assert result.tool_calls == [ToolCallRequest(id="toolu_1", name="search_articles", arguments={"query": "foo"})]
+        assert result.text == ""
+
+    @pytest.mark.asyncio
+    async def test_complete_translates_tool_round_trip_messages(self):
+        provider = ClaudeProvider(api_key="test-key")
+        mock_response = MagicMock()
+        mock_response.content = [MagicMock(type="text", text="final answer")]
+        mock_response.usage = MagicMock(input_tokens=0, output_tokens=0)
+        round_trip_messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "toolu_1", "name": "search_articles", "arguments": {"query": "foo"}}]},
+            {"role": "tool", "tool_call_id": "toolu_1", "name": "search_articles", "content": "[1] Title\nchunk text", "is_error": False},
+        ]
+        with patch.object(provider._client.messages, "create", new_callable=AsyncMock, return_value=mock_response) as mock_create:
+            await provider.complete(round_trip_messages, 100)
+        sent = mock_create.call_args.kwargs["messages"]
+        assert sent[1] == {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "search_articles", "input": {"query": "foo"}}]}
+        assert sent[2] == {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "[1] Title\nchunk text", "is_error": False}],
+        }
 
 
 class TestGeminiProvider:
@@ -60,7 +99,7 @@ class TestGeminiProvider:
         mock_response.candidates = [MagicMock(finish_reason=finish_reason)]
         with patch.object(provider._client.models, "generate_content", return_value=mock_response) as mock_gen:
             result = await provider.complete(MESSAGES, 1024)
-        assert result == (None, "RAG is a retrieval technique.")
+        assert result.text == "RAG is a retrieval technique."
         mock_gen.assert_called_once()
 
     @pytest.mark.asyncio
@@ -73,7 +112,7 @@ class TestGeminiProvider:
         mock_response.text = ""
         with patch.object(provider._client.models, "generate_content", return_value=mock_response):
             result = await provider.complete(MESSAGES, 1024)
-        assert result == (None, "")
+        assert result.text == ""
 
     @pytest.mark.asyncio
     async def test_complete_raises_on_resource_exhausted(self):
@@ -104,4 +143,4 @@ class TestOpenRouterProvider:
             mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
             mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
             result = await provider.complete(MESSAGES, 1024)
-        assert result == (None, "RAG combines retrieval with generation.")
+        assert result.text == "RAG combines retrieval with generation."

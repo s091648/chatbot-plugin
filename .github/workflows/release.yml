@@ -15,6 +15,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.CHATBOT_PLUGIN_RELEASE_PAT }}
 
       - name: Set version from tag
         run: |

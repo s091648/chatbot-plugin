@@ -13,6 +13,7 @@ dependencies = [
     "google-genai>=1.0",
     "httpx",
     "tenacity",
+    "python-logging-loki>=0.3",
 ]
 
 [tool.uv.sources]

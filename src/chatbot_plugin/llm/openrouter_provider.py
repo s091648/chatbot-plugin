@@ -5,7 +5,7 @@ import logging
 
 import httpx
 
-from chatbot_plugin.llm.base import LLMResult, ToolCallRequest, ToolSpec
+from chatbot_plugin.llm.base import LLMResult, TextDelta, ThinkingDelta, ToolCallRequest, ToolSpec
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,10 @@ class OpenRouterProvider:
             "model": self.model,
             "messages": [self._to_openrouter_message(m) for m in messages],
             "max_tokens": max_tokens,
+            # No-op for models that don't support reasoning — OpenRouter's unified API just
+            # drops unsupported params rather than erroring — but surfaces it for the ones
+            # that do (routed provider must actually support extended thinking).
+            "reasoning": {"enabled": True},
         }
         if tools:
             payload["tools"] = [
@@ -56,7 +60,77 @@ class OpenRouterProvider:
             )
             for tc in message.get("tool_calls") or []
         ]
-        return LLMResult(thinking=None, text=message.get("content") or "", tool_calls=tool_calls)
+        return LLMResult(thinking=message.get("reasoning") or None, text=message.get("content") or "", tool_calls=tool_calls)
+
+    async def stream(
+        self,
+        messages: list[dict],
+        max_tokens: int,
+        tools: list[ToolSpec] | None = None,
+    ):
+        payload: dict = {
+            "model": self.model,
+            "messages": [self._to_openrouter_message(m) for m in messages],
+            "max_tokens": max_tokens,
+            "stream": True,
+            "reasoning": {"enabled": True},
+        }
+        if tools:
+            payload["tools"] = [
+                {"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.input_schema}}
+                for t in tools
+            ]
+
+        # index -> in-progress tool call being assembled from OpenAI-style streamed fragments
+        tool_calls: dict[int, dict] = {}
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST",
+                _API_URL,
+                headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=60,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    raw = line[len("data: "):].strip()
+                    if raw == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = data.get("choices") or []
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta") or {}
+                    content = delta.get("content")
+                    if content:
+                        yield TextDelta(text=content)
+                    reasoning = delta.get("reasoning")
+                    if reasoning:
+                        yield ThinkingDelta(text=reasoning)
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        entry = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+                        if tc.get("id"):
+                            entry["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            entry["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            entry["arguments"] += fn["arguments"]
+
+        for idx, entry in tool_calls.items():
+            yield ToolCallRequest(
+                id=entry["id"] or f"call_{idx}",
+                name=entry["name"] or "",
+                arguments=self._parse_tool_arguments(entry["arguments"]),
+            )
+
+        logger.info("openrouter_stream_completed", extra={"model": self.model})
 
     @staticmethod
     def _parse_tool_arguments(raw_arguments: str | None) -> dict:

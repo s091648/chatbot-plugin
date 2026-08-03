@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 
@@ -9,16 +10,26 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
 from chatbot_plugin.config import CHAT_SERVICE_API_KEY
-from chatbot_plugin.llm.base import AllProvidersExhausted
+from chatbot_plugin.llm.base import AllProvidersExhausted, TextDelta, ThinkingDelta
 from chatbot_plugin.contracts.chat_completion import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionChoice,
     ChatCompletionChoiceMessage,
 )
-from chatbot_plugin.services.chat_service import ChatService
+from chatbot_plugin.services.chat_service import (
+    ChatService,
+    SourcesReady,
+    StreamFailed,
+    ToolCallFinished,
+    ToolCallStarted,
+)
+
+logger = logging.getLogger(__name__)
 
 api_router = APIRouter(prefix="/v1")
+
+_STREAM_INTERRUPTED_SUFFIX = "\n\n⚠️ The response was interrupted by a provider error. Please try asking again."
 
 
 def _get_chat_service(request: Request) -> ChatService:
@@ -49,90 +60,111 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             detail="messages must contain at least one user message with non-empty content",
         )
 
+    if not req.stream:
+        try:
+            result = await service.chat(last_message, topic_id=req.topic_id, pinned_article_ids=req.pinned_article_ids)
+        except AllProvidersExhausted:
+            raise HTTPException(
+                status_code=503,
+                detail="All LLM providers are currently unavailable. Please try again later.",
+            )
+        return ChatCompletionResponse(
+            model=req.model,
+            choices=[
+                ChatCompletionChoice(
+                    message=ChatCompletionChoiceMessage(content=result.reply),
+                )
+            ],
+        )
+
+    # Starlette sends the HTTP status line as soon as StreamingResponse starts iterating its
+    # body — before that point we can still raise HTTPException for a clean 503; after it, the
+    # 200 is already committed and a total failure can only be reported inline in the stream.
+    # So the first event is pulled here, outside the generator, while that's still possible.
+    event_stream = service.chat_stream(last_message, topic_id=req.topic_id, pinned_article_ids=req.pinned_article_ids)
     try:
-        result = await service.chat(last_message, topic_id=req.topic_id, pinned_article_ids=req.pinned_article_ids)
+        first_event = await event_stream.__anext__()
+    except StopAsyncIteration:
+        first_event = None
     except AllProvidersExhausted:
         raise HTTPException(
             status_code=503,
             detail="All LLM providers are currently unavailable. Please try again later.",
         )
 
-    if req.stream:
-        cid = f"chatcmpl-{secrets.token_hex(12)}"
-        ts = int(time.time())
+    cid = f"chatcmpl-{secrets.token_hex(12)}"
+    ts = int(time.time())
 
-        async def sse_generator():
-            if result.thinking:
-                thinking_payload = {"thinking": result.thinking}
-                yield f"data: {json.dumps(thinking_payload)}\n\n".encode()
+    def _content_frame(text: str) -> bytes:
+        chunk = {
+            "id": cid, "object": "chat.completion.chunk",
+            "created": ts, "model": req.model,
+            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+        }
+        return f"data: {json.dumps(chunk)}\n\n".encode()
 
-            if result.tool_calls_executed:
-                for call in result.tool_calls_executed:
-                    tool_call_chunk = {
-                        "id": cid, "object": "chat.completion.chunk",
-                        "created": ts, "model": req.model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"tool_calls": [{
-                                "id": call.id,
-                                "type": "function",
-                                "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
-                            }]},
-                            "finish_reason": None,
-                        }],
-                    }
-                    yield f"data: {json.dumps(tool_call_chunk)}\n\n".encode()
-
-                    tool_result_payload = {
-                        "tool_result": {
-                            "tool_call_id": call.id,
-                            "content": call.result_summary,
-                            "is_error": call.is_error,
-                        }
-                    }
-                    yield f"data: {json.dumps(tool_result_payload)}\n\n".encode()
-
-            content_chunk = {
+    def _event_to_frames(event) -> list[bytes]:
+        if isinstance(event, ThinkingDelta):
+            return [f"data: {json.dumps({'thinking': event.text})}\n\n".encode()]
+        if isinstance(event, TextDelta):
+            return [_content_frame(event.text)]
+        if isinstance(event, ToolCallStarted):
+            tool_call_chunk = {
                 "id": cid, "object": "chat.completion.chunk",
                 "created": ts, "model": req.model,
-                "choices": [{"index": 0, "delta": {"content": result.reply}, "finish_reason": None}],
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "id": event.id,
+                        "type": "function",
+                        "function": {"name": event.name, "arguments": json.dumps(event.arguments)},
+                    }]},
+                    "finish_reason": None,
+                }],
             }
-            yield f"data: {json.dumps(content_chunk)}\n\n".encode()
-
-            done_chunk = {
-                "id": cid, "object": "chat.completion.chunk",
-                "created": ts, "model": req.model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            yield f"data: {json.dumps(done_chunk)}\n\n".encode()
-
-            if result.articles_used:
-                sources_payload = {
-                    "sources": [
-                        {
-                            "id": ref.id,
-                            "title": ref.title,
-                            "url": ref.url,
-                            "public_article_id": ref.public_article_id,
-                        }
-                        for ref in result.articles_used
-                    ]
+            return [f"data: {json.dumps(tool_call_chunk)}\n\n".encode()]
+        if isinstance(event, ToolCallFinished):
+            tool_result_payload = {
+                "tool_result": {
+                    "tool_call_id": event.id,
+                    "content": event.result_summary,
+                    "is_error": event.is_error,
                 }
-                yield f"data: {json.dumps(sources_payload)}\n\n".encode()
+            }
+            return [f"data: {json.dumps(tool_result_payload)}\n\n".encode()]
+        if isinstance(event, SourcesReady):
+            if not event.articles:
+                return []
+            sources_payload = {
+                "sources": [
+                    {"id": ref.id, "title": ref.title, "url": ref.url, "public_article_id": ref.public_article_id}
+                    for ref in event.articles
+                ]
+            }
+            return [f"data: {json.dumps(sources_payload)}\n\n".encode()]
+        if isinstance(event, StreamFailed):
+            logger.error("chat_stream_failed", extra={"error": event.message})
+            return [_content_frame(_STREAM_INTERRUPTED_SUFFIX)]
+        return []
 
-            yield b"data: [DONE]\n\n"
+    async def sse_generator():
+        if first_event is not None:
+            for frame in _event_to_frames(first_event):
+                yield frame
+        async for event in event_stream:
+            for frame in _event_to_frames(event):
+                yield frame
 
-        return StreamingResponse(
-            sse_generator(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        done_chunk = {
+            "id": cid, "object": "chat.completion.chunk",
+            "created": ts, "model": req.model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(done_chunk)}\n\n".encode()
+        yield b"data: [DONE]\n\n"
 
-    return ChatCompletionResponse(
-        model=req.model,
-        choices=[
-            ChatCompletionChoice(
-                message=ChatCompletionChoiceMessage(content=result.reply),
-            )
-        ],
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

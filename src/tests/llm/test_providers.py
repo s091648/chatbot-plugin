@@ -1,9 +1,10 @@
 """Tests for LLM provider implementations (mocked API calls)."""
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from chatbot_plugin.llm.base import LLMProvider, ToolCallRequest, ToolSpec
+from chatbot_plugin.llm.base import LLMProvider, TextDelta, ThinkingDelta, ToolCallRequest, ToolSpec
 from chatbot_plugin.llm.claude_provider import ClaudeProvider
 from chatbot_plugin.llm.gemini_provider import GeminiProvider
 from chatbot_plugin.llm.openrouter_provider import OpenRouterProvider
@@ -99,11 +100,75 @@ class TestClaudeProvider:
             "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "[1] Title\nchunk text", "is_error": False}],
         }
 
+    @pytest.mark.asyncio
+    async def test_stream_yields_thinking_and_text_deltas(self):
+        provider = ClaudeProvider(api_key="test-key")
+        events = [
+            MagicMock(type="content_block_delta", index=0, delta=MagicMock(type="thinking_delta", thinking="pondering")),
+            MagicMock(type="content_block_delta", index=0, delta=MagicMock(type="text_delta", text="Hello")),
+            MagicMock(type="content_block_delta", index=0, delta=MagicMock(type="text_delta", text=" world")),
+        ]
+        with patch.object(provider._client.messages, "stream", return_value=_FakeClaudeStream(events)):
+            emitted = [e async for e in provider.stream(MESSAGES, 100)]
+        assert emitted == [ThinkingDelta(text="pondering"), TextDelta(text="Hello"), TextDelta(text=" world")]
+
+    @pytest.mark.asyncio
+    async def test_stream_assembles_tool_use_from_input_json_deltas(self):
+        provider = ClaudeProvider(api_key="test-key")
+        tool_use_block = MagicMock(type="tool_use", id="toolu_1")
+        tool_use_block.name = "search_articles"  # MagicMock(name=...) is reserved for repr, not an attribute
+        events = [
+            MagicMock(type="content_block_start", index=0, content_block=tool_use_block),
+            MagicMock(type="content_block_delta", index=0, delta=MagicMock(type="input_json_delta", partial_json='{"query"')),
+            MagicMock(type="content_block_delta", index=0, delta=MagicMock(type="input_json_delta", partial_json=': "foo"}')),
+            MagicMock(type="content_block_stop", index=0),
+        ]
+        with patch.object(provider._client.messages, "stream", return_value=_FakeClaudeStream(events)):
+            emitted = [e async for e in provider.stream(MESSAGES, 100, tools=[ToolSpec("search_articles", "d", {})])]
+        assert emitted == [ToolCallRequest(id="toolu_1", name="search_articles", arguments={"query": "foo"})]
+
+
+class _FakeClaudeStream:
+    """Stands in for anthropic's `async with client.messages.stream(...) as stream:` context
+    manager — `stream` itself is what's async-iterated, not something returned by __aenter__."""
+    def __init__(self, events):
+        self._events = events
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return None
+
+    def __aiter__(self):
+        return self._iter_events()
+
+    async def _iter_events(self):
+        for event in self._events:
+            yield event
+
 
 class TestGeminiProvider:
     def test_satisfies_protocol(self):
         provider = GeminiProvider(api_key="test-key")
         assert isinstance(provider, LLMProvider)
+
+    @pytest.mark.asyncio
+    async def test_complete_requests_thought_summaries_with_automatic_budget(self):
+        """include_thoughts alone isn't enough — some models (gemini-2.5-flash-lite) default
+        thinking to budget 0 (disabled), so there'd be nothing to summarize without also
+        forcing a non-zero (automatic) budget."""
+        provider = GeminiProvider(api_key="test-key")
+        mock_response = MagicMock()
+        mock_response.text = "ok"
+        finish_reason = MagicMock()
+        finish_reason.name = "STOP"
+        mock_response.candidates = [MagicMock(finish_reason=finish_reason)]
+        with patch.object(provider._client.models, "generate_content", return_value=mock_response) as mock_gen:
+            await provider.complete(MESSAGES, 100)
+        thinking_config = mock_gen.call_args.kwargs["config"].thinking_config
+        assert thinking_config.include_thoughts is True
+        assert thinking_config.thinking_budget == -1
 
     @pytest.mark.asyncio
     async def test_complete_sends_messages(self):
@@ -156,7 +221,7 @@ class TestGeminiProvider:
     @pytest.mark.asyncio
     async def test_complete_parses_function_call_part(self):
         provider = GeminiProvider(api_key="test-key")
-        fc_part = MagicMock(text=None, thought=False)
+        fc_part = MagicMock(text=None, thought=False, thought_signature=b"sig-bytes")
         fc_mock = MagicMock(args={"query": "foo"})
         fc_mock.name = "search_articles"  # MagicMock(name=...) is reserved for repr, not an attribute
         fc_part.function_call = fc_mock
@@ -169,6 +234,7 @@ class TestGeminiProvider:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "search_articles"
         assert result.tool_calls[0].arguments == {"query": "foo"}
+        assert result.tool_calls[0].thought_signature == b"sig-bytes"
 
     @pytest.mark.asyncio
     async def test_complete_translates_tool_round_trip_messages(self):
@@ -191,6 +257,75 @@ class TestGeminiProvider:
         assert contents[1].parts[0].function_call.name == "search_articles"
         assert contents[2].role == "user"
         assert contents[2].parts[0].function_response.name == "search_articles"
+
+    @pytest.mark.asyncio
+    async def test_complete_round_trip_reattaches_thought_signature(self):
+        """Gemini 3 rejects a follow-up turn whose function-call part is missing the
+        thought_signature the model originally attached to it — this must survive the
+        round trip through the generic message dict, not just the raw SDK response."""
+        provider = GeminiProvider(api_key="test-key")
+        mock_response = MagicMock()
+        mock_response.text = "final answer"
+        finish_reason = MagicMock()
+        finish_reason.name = "STOP"
+        mock_response.candidates = [MagicMock(finish_reason=finish_reason)]
+        round_trip_messages = [
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_0", "name": "search_articles", "arguments": {"query": "foo"},
+                    "thought_signature": b"sig-bytes",
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_0", "name": "search_articles", "content": "result", "is_error": False},
+        ]
+        with patch.object(provider._client.models, "generate_content", return_value=mock_response) as mock_gen:
+            await provider.complete(round_trip_messages, 100)
+        contents = mock_gen.call_args.kwargs["contents"]
+        assert contents[1].parts[0].thought_signature == b"sig-bytes"
+
+    @pytest.mark.asyncio
+    async def test_stream_yields_thinking_and_text_deltas(self):
+        provider = GeminiProvider(api_key="test-key")
+        thinking_part = MagicMock(text="pondering", thought=True, function_call=None)
+        text_part = MagicMock(text="Hello", thought=False, function_call=None)
+
+        async def _chunks():
+            yield MagicMock(candidates=[MagicMock(content=MagicMock(parts=[thinking_part]))])
+            yield MagicMock(candidates=[MagicMock(content=MagicMock(parts=[text_part]))])
+
+        with patch.object(provider._client.aio.models, "generate_content_stream", new_callable=AsyncMock, return_value=_chunks()):
+            events = [e async for e in provider.stream(MESSAGES, 100)]
+        assert events == [ThinkingDelta(text="pondering"), TextDelta(text="Hello")]
+
+    @pytest.mark.asyncio
+    async def test_stream_yields_tool_call_with_thought_signature(self):
+        provider = GeminiProvider(api_key="test-key")
+        fc_mock = MagicMock(args={"query": "foo"})
+        fc_mock.name = "search_articles"
+        fc_part = MagicMock(text=None, thought=False, thought_signature=b"sig-bytes")
+        fc_part.function_call = fc_mock
+
+        async def _chunks():
+            yield MagicMock(candidates=[MagicMock(content=MagicMock(parts=[fc_part]))])
+
+        with patch.object(provider._client.aio.models, "generate_content_stream", new_callable=AsyncMock, return_value=_chunks()):
+            events = [e async for e in provider.stream(MESSAGES, 100, tools=[ToolSpec("search_articles", "d", {})])]
+        assert events == [ToolCallRequest(
+            id="call_0", name="search_articles", arguments={"query": "foo"}, thought_signature=b"sig-bytes",
+        )]
+
+    @pytest.mark.asyncio
+    async def test_stream_raises_rate_limit_on_daily_quota_error(self):
+        from chatbot_plugin_sdk import RateLimitExhausted
+        provider = GeminiProvider(api_key="test-key")
+        error = Exception("429 RESOURCE_EXHAUSTED PerDay limit exceeded")
+        with patch.object(provider._client.aio.models, "generate_content_stream", new_callable=AsyncMock, side_effect=error):
+            with pytest.raises(RateLimitExhausted):
+                async for _ in provider.stream(MESSAGES, 100):
+                    pass
 
 
 class TestOpenRouterProvider:
@@ -227,6 +362,36 @@ class TestOpenRouterProvider:
             await provider.complete(MESSAGES, 1024, tools=tools)
         sent_payload = mock_client.post.call_args.kwargs["json"]
         assert sent_payload["tools"] == [{"type": "function", "function": {"name": "search_articles", "description": "search", "parameters": {"type": "object"}}}]
+
+    @pytest.mark.asyncio
+    async def test_complete_requests_reasoning(self):
+        """No-op for non-reasoning models (OpenRouter drops unsupported params), but needed
+        for reasoning-capable models routed through OpenRouter to surface thinking at all."""
+        provider = OpenRouterProvider(api_key="test-key", model="meta-llama/llama-3-70b")
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        mock_response.raise_for_status = MagicMock()
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            await provider.complete(MESSAGES, 1024)
+        assert mock_client.post.call_args.kwargs["json"]["reasoning"] == {"enabled": True}
+
+    @pytest.mark.asyncio
+    async def test_complete_surfaces_reasoning_as_thinking(self):
+        provider = OpenRouterProvider(api_key="test-key", model="meta-llama/llama-3-70b")
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"choices": [{"message": {"content": "answer", "reasoning": "pondering..."}}]}
+        mock_response.raise_for_status = MagicMock()
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.post = AsyncMock(return_value=mock_response)
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            result = await provider.complete(MESSAGES, 1024)
+        assert result.thinking == "pondering..."
 
     @pytest.mark.asyncio
     async def test_complete_parses_tool_calls_response(self):
@@ -287,3 +452,65 @@ class TestOpenRouterProvider:
         sent_messages = mock_client.post.call_args.kwargs["json"]["messages"]
         assert sent_messages[1]["tool_calls"][0]["function"]["arguments"] == '{"query": "foo"}'
         assert sent_messages[2] == {"role": "tool", "tool_call_id": "call_1", "content": "[1] Title\nchunk text"}
+
+    def _fake_sse_response(self, lines: list[str]) -> MagicMock:
+        """Stands in for the httpx.Response yielded by `async with client.stream(...) as response`."""
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+
+        async def _aiter_lines():
+            for line in lines:
+                yield line
+        response.aiter_lines = _aiter_lines
+        return response
+
+    def _stream_context_manager(self, response: MagicMock) -> AsyncMock:
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=response)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        return cm
+
+    @pytest.mark.asyncio
+    async def test_stream_yields_text_deltas(self):
+        provider = OpenRouterProvider(api_key="test-key", model="meta-llama/llama-3-70b")
+        lines = [
+            f"data: {json.dumps({'choices': [{'delta': {'content': 'Hello'}}]})}",
+            f"data: {json.dumps({'choices': [{'delta': {'content': ' world'}}]})}",
+            "data: [DONE]",
+        ]
+        response = self._fake_sse_response(lines)
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.stream = MagicMock(return_value=self._stream_context_manager(response))
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            events = [e async for e in provider.stream(MESSAGES, 1024)]
+        assert events == [TextDelta(text="Hello"), TextDelta(text=" world")]
+        sent_payload = mock_client.stream.call_args.kwargs["json"]
+        assert sent_payload["stream"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_assembles_fragmented_tool_call(self):
+        """OpenAI-style streaming delivers a tool call's arguments as index-keyed fragments
+        across multiple chunks — this must be buffered and only surfaced once complete."""
+        provider = OpenRouterProvider(api_key="test-key", model="meta-llama/llama-3-70b")
+        chunks = [
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"name": "search_articles", "arguments": ""}}
+            ]}}]},
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": '{"query"'}}
+            ]}}]},
+            {"choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": ': "foo"}'}}
+            ]}}]},
+        ]
+        lines = [f"data: {json.dumps(c)}" for c in chunks] + ["data: [DONE]"]
+        response = self._fake_sse_response(lines)
+        with patch("chatbot_plugin.llm.openrouter_provider.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.stream = MagicMock(return_value=self._stream_context_manager(response))
+            mock_client_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=None)
+            events = [e async for e in provider.stream(MESSAGES, 1024, tools=[ToolSpec("search_articles", "d", {})])]
+        assert events == [ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "foo"})]

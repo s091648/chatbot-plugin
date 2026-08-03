@@ -3,9 +3,20 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from typing import AsyncIterator
 
 from chatbot_plugin_sdk.contracts.responses import ChunkResult
-from chatbot_plugin.llm.base import AllProvidersExhausted, LLMResult, ProviderHandler, ResilientLLMService, ToolCallRequest, ToolSpec
+from chatbot_plugin.llm.base import (
+    AllProvidersExhausted,
+    LLMResult,
+    ProviderHandler,
+    ResilientLLMService,
+    StreamError,
+    TextDelta,
+    ThinkingDelta,
+    ToolCallRequest,
+    ToolSpec,
+)
 from chatbot_plugin_sdk.processors.retrieve import RetrieveProcessor
 
 logger = logging.getLogger(__name__)
@@ -84,6 +95,42 @@ class ChatResult:
     tool_calls_executed: list[ToolCallExecution] = field(default_factory=list)
 
 
+# ── Streaming event types (ChatService.chat_stream) ────────────────────────────────────────
+# ThinkingDelta / TextDelta are forwarded straight from the LLM provider layer (chatbot_plugin.
+# llm.base) — same shape, no translation needed. The rest are domain-level events chat_stream
+# adds on top: tool-call lifecycle and the final source-article list (only knowable once the
+# full reply text has streamed in, since it's derived from which [N] citations appear in it).
+
+@dataclass
+class ToolCallStarted:
+    id: str
+    name: str
+    arguments: dict
+
+
+@dataclass
+class ToolCallFinished:
+    id: str
+    name: str
+    result_summary: str
+    is_error: bool
+
+
+@dataclass
+class SourcesReady:
+    articles: list[ArticleRef]
+
+
+@dataclass
+class StreamFailed:
+    """Terminal event: the provider failed after already streaming some output for this turn.
+    See ResilientLLMService.stream_complete for why this can't fall back to another provider."""
+    message: str
+
+
+ChatStreamEvent = ThinkingDelta | TextDelta | ToolCallStarted | ToolCallFinished | SourcesReady | StreamFailed
+
+
 class ChatService:
     def __init__(
         self,
@@ -132,6 +179,126 @@ class ChatService:
         articles_used = self._filter_cited_articles(result.text, articles)
         return ChatResult(reply=result.text, articles_used=articles_used, thinking=result.thinking, chunks=merged)
 
+    async def chat_stream(
+        self,
+        message: str,
+        topic_id: str | None = None,
+        pinned_article_ids: list[str] | None = None,
+    ) -> AsyncIterator[ChatStreamEvent]:
+        """Streaming counterpart to chat(). Raises AllProvidersExhausted if the LLM call fails
+        before producing any output at all (caller can still return a clean error response at
+        that point); once anything has streamed, failures surface as a StreamFailed event
+        instead (see ResilientLLMService.stream_complete)."""
+        if pinned_article_ids:
+            async for event in self._chat_pinned_stream(message, pinned_article_ids):
+                yield event
+            return
+
+        search_result = await self._retriever.retrieve(
+            message,
+            top_k=self._max_context_chunks,
+            min_score=self._min_score,
+            min_rerank_score=self._min_rerank_score,
+            filters={"topic_id": topic_id} if topic_id else None,
+        )
+        merged = search_result.chunks[: self._max_context_chunks]
+        if not merged:
+            yield TextDelta(text=_NO_RELEVANT_INFO_REPLY)
+            yield SourcesReady(articles=[])
+            return
+
+        articles, article_index = self._collect_articles(merged)
+        context = self._build_context(merged, article_index)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
+        ]
+
+        reply_parts: list[str] = []
+        async for _, event in self._llm.stream_complete(messages, self._max_tokens):
+            if isinstance(event, StreamError):
+                yield StreamFailed(message=event.message)
+                return
+            if isinstance(event, TextDelta):
+                reply_parts.append(event.text)
+            yield event
+
+        yield SourcesReady(articles=self._filter_cited_articles("".join(reply_parts), articles))
+
+    async def _chat_pinned_stream(self, message: str, pinned_article_ids: list[str]) -> AsyncIterator[ChatStreamEvent]:
+        pinned_chunks = (await self._fetch_pinned_chunks(message, pinned_article_ids))[: self._max_context_chunks]
+        articles, article_index = self._collect_articles(pinned_chunks)
+        context = self._build_context(pinned_chunks, article_index) if pinned_chunks else "(no content available for the pinned article(s))"
+        messages = [
+            {"role": "system", "content": PINNED_SYSTEM_PROMPT},
+            {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
+        ]
+
+        # This first call is still safe to retry across providers on total failure (nothing
+        # streamed yet) — that fallback lives inside stream_complete itself, same as complete().
+        tool_calls: list[ToolCallRequest] = []
+        handler: ProviderHandler | None = None
+        first_call_text: list[str] = []
+        async for h, event in self._llm.stream_complete(messages, self._max_tokens, tools=[SEARCH_TOOL]):
+            handler = h
+            if isinstance(event, StreamError):
+                yield StreamFailed(message=event.message)
+                return
+            if isinstance(event, ToolCallRequest):
+                tool_calls.append(event)
+                continue
+            if isinstance(event, TextDelta):
+                first_call_text.append(event.text)
+            yield event
+
+        if not tool_calls:
+            yield SourcesReady(articles=self._filter_cited_articles("".join(first_call_text), articles))
+            return
+
+        # Emit "started" up front (id/name/arguments are already known from the tool_calls
+        # themselves) so the tool card can show a running state for the retrieval below,
+        # instead of only ever appearing already-finished.
+        for call in tool_calls:
+            yield ToolCallStarted(id=call.id, name=call.name, arguments=call.arguments)
+
+        tool_executions, tool_result_messages, all_chunks, articles, article_index = await self._execute_tool_calls(
+            tool_calls, pinned_chunks, articles, article_index
+        )
+        for execution in tool_executions:
+            yield ToolCallFinished(
+                id=execution.id, name=execution.name,
+                result_summary=execution.result_summary, is_error=execution.is_error,
+            )
+
+        messages.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": c.id, "name": c.name, "arguments": c.arguments, "thought_signature": c.thought_signature}
+                for c in tool_calls
+            ],
+        })
+        messages.extend(tool_result_messages)
+
+        # The follow-up call is pinned to the same handler (Gemini requires the same model that
+        # made the tool call for continuity — see thought_signature). It can no longer fall back
+        # to a different provider on failure: the tool call above has already been streamed to
+        # the client as visible output, so a silent restart would produce a duplicated turn.
+        reply_parts: list[str] = []
+        try:
+            async for _, event in self._llm.stream_complete(messages, self._max_tokens, tools=None, pinned_handler=handler):
+                if isinstance(event, StreamError):
+                    yield StreamFailed(message=event.message)
+                    return
+                if isinstance(event, TextDelta):
+                    reply_parts.append(event.text)
+                yield event
+        except AllProvidersExhausted:
+            yield StreamFailed(message="the model provider failed after the tool call")
+            return
+
+        yield SourcesReady(articles=self._filter_cited_articles("".join(reply_parts), articles))
+
     async def _chat_pinned(self, message: str, pinned_article_ids: list[str]) -> ChatResult:
         exclude: set[str] = set()
         while True:
@@ -155,7 +322,10 @@ class ChatService:
             messages.append({
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in result.tool_calls],
+                "tool_calls": [
+                    {"id": c.id, "name": c.name, "arguments": c.arguments, "thought_signature": c.thought_signature}
+                    for c in result.tool_calls
+                ],
             })
             messages.extend(tool_result_messages)
 

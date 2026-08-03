@@ -4,8 +4,24 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chatbot_plugin_sdk.contracts.responses import ChunkResult, SearchResponse
-from chatbot_plugin.services.chat_service import ChatService, ArticleRef, SYSTEM_PROMPT
-from chatbot_plugin.llm.base import AllProvidersExhausted, LLMResult, ProviderHandler, ToolCallRequest
+from chatbot_plugin.services.chat_service import (
+    ArticleRef,
+    ChatService,
+    SourcesReady,
+    StreamFailed,
+    SYSTEM_PROMPT,
+    ToolCallFinished,
+    ToolCallStarted,
+)
+from chatbot_plugin.llm.base import (
+    AllProvidersExhausted,
+    LLMResult,
+    ProviderHandler,
+    StreamError,
+    TextDelta,
+    ThinkingDelta,
+    ToolCallRequest,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -67,6 +83,33 @@ def _service(chunks=None, pinned_chunks=None, reply="Generated reply", **kwargs)
     return ChatService(
         retriever=_mock_retriever(chunks=chunks, pinned_chunks=pinned_chunks),
         llm=_mock_llm(reply=reply),
+        **kwargs,
+    )
+
+
+def _mock_stream_llm(events=None, reply="Generated reply"):
+    """LLM mock whose stream_complete() yields a fixed (handler, event) sequence, matching
+    ResilientLLMService.stream_complete(). Ignores which turn (tools vs. pinned_handler) it's
+    called for — tests that need call-dependent behaviour (e.g. the tool-call round trip) wire
+    llm.stream_complete directly instead of using this helper."""
+    handler = _fake_handler()
+    stream_events = events if events is not None else [TextDelta(text=reply)]
+
+    def _stream_complete(*args, **kwargs):
+        async def _gen():
+            for event in stream_events:
+                yield (handler, event)
+        return _gen()
+
+    llm = MagicMock()
+    llm.stream_complete = _stream_complete
+    return llm
+
+
+def _service_stream(chunks=None, pinned_chunks=None, events=None, reply="Generated reply", **kwargs):
+    return ChatService(
+        retriever=_mock_retriever(chunks=chunks, pinned_chunks=pinned_chunks),
+        llm=_mock_stream_llm(events=events, reply=reply),
         **kwargs,
     )
 
@@ -207,6 +250,45 @@ class TestChatService:
         ]
         result = await _service(chunks=chunks, reply="No citations here.").chat("q")
         assert [a.id for a in result.articles_used] == ["a1", "a2"]
+
+
+# ── Streaming (non-pinned) ─────────────────────────────────────────────────────
+
+class TestChatServiceStreaming:
+    @pytest.mark.asyncio
+    async def test_chat_stream_forwards_deltas_then_sources(self):
+        chunks = [_chunk(chunk_id="c1", article_id="a1", title="Article 1")]
+        service = _service_stream(
+            chunks=chunks,
+            events=[ThinkingDelta(text="pondering"), TextDelta(text="RAG "), TextDelta(text="is cool [1]")],
+        )
+        events = [e async for e in service.chat_stream("What is RAG?")]
+        assert events[:-1] == [
+            ThinkingDelta(text="pondering"),
+            TextDelta(text="RAG "),
+            TextDelta(text="is cool [1]"),
+        ]
+        assert isinstance(events[-1], SourcesReady)
+        assert [a.id for a in events[-1].articles] == ["a1"]
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_yields_fallback_reply_when_nothing_retrieved(self):
+        service = _service_stream(chunks=[])
+        events = [e async for e in service.chat_stream("obscure question")]
+        text_events = [e for e in events if isinstance(e, TextDelta)]
+        assert len(text_events) == 1
+        assert "couldn't find relevant information" in text_events[0].text
+        assert isinstance(events[-1], SourcesReady)
+        assert events[-1].articles == []
+
+    @pytest.mark.asyncio
+    async def test_chat_stream_surfaces_stream_error_as_stream_failed(self):
+        service = _service_stream(
+            chunks=[_chunk()],
+            events=[TextDelta(text="partial"), StreamError("boom")],
+        )
+        events = [e async for e in service.chat_stream("q")]
+        assert events == [TextDelta(text="partial"), StreamFailed(message="boom")]
 
 
 # ── Pinned article behaviour ──────────────────────────────────────────────────
@@ -431,6 +513,108 @@ class TestPinnedToolCalling:
         result = await service.chat("question", pinned_article_ids=None)
         assert result.tool_calls_executed == []
         assert result.reply == "Normal reply"
+
+
+# ── Pinned tool calling (streaming) ─────────────────────────────────────────────
+
+def _stream_gen(events, handler=None):
+    h = handler or _fake_handler()
+    async def _gen():
+        for event in events:
+            yield (h, event)
+    return _gen()
+
+
+class TestPinnedToolCallingStreaming:
+    @pytest.mark.asyncio
+    async def test_no_tool_call_streams_straight_through(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        llm = MagicMock()
+        llm.stream_complete = lambda *a, **kw: _stream_gen(
+            [ThinkingDelta(text="checking pinned content"), TextDelta(text="Generated reply")]
+        )
+        service = ChatService(retriever=_mock_retriever(pinned_chunks=pinned_chunks), llm=llm)
+
+        events = [e async for e in service.chat_stream("what is this about", pinned_article_ids=["pub"])]
+
+        assert events[:-1] == [ThinkingDelta(text="checking pinned content"), TextDelta(text="Generated reply")]
+        assert isinstance(events[-1], SourcesReady)
+        assert not any(isinstance(e, (ToolCallStarted, ToolCallFinished)) for e in events)
+
+    @pytest.mark.asyncio
+    async def test_tool_call_streams_started_finished_then_follow_up_text(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        searched_chunks = [_chunk(chunk_id="s1", article_id="a-searched", title="Searched")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "broader topic"})
+        handler = _fake_handler()
+
+        def stream_complete(messages, max_tokens, tools=None, pinned_handler=None, exclude=None):
+            if tools:
+                return _stream_gen([tool_call], handler=handler)
+            assert pinned_handler is handler  # follow-up must reuse the same provider
+            return _stream_gen([TextDelta(text="Final answer citing [2]")], handler=handler)
+
+        llm = MagicMock()
+        llm.stream_complete = stream_complete
+        retriever = _mock_retriever(chunks=searched_chunks, pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7)
+
+        events = [e async for e in service.chat_stream("broad question", pinned_article_ids=["pub"])]
+
+        started = [e for e in events if isinstance(e, ToolCallStarted)]
+        finished = [e for e in events if isinstance(e, ToolCallFinished)]
+        text = "".join(e.text for e in events if isinstance(e, TextDelta))
+        assert started == [ToolCallStarted(id="call_1", name="search_articles", arguments={"query": "broader topic"})]
+        assert len(finished) == 1 and finished[0].is_error is False
+        assert text == "Final answer citing [2]"
+        # tool card must appear before the follow-up text in the stream, not after
+        assert events.index(started[0]) < [i for i, e in enumerate(events) if isinstance(e, TextDelta)][0]
+
+    @pytest.mark.asyncio
+    async def test_followup_failure_after_tool_call_yields_stream_failed_not_silent_retry(self):
+        """Once the tool call has streamed, a failed follow-up can't restart with a different
+        provider (that output is already visible) — it must surface as StreamFailed instead."""
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"})
+
+        def stream_complete(messages, max_tokens, tools=None, pinned_handler=None, exclude=None):
+            if tools:
+                return _stream_gen([tool_call])
+
+            async def _gen():
+                if False:
+                    yield
+                raise AllProvidersExhausted()
+            return _gen()
+
+        llm = MagicMock()
+        llm.stream_complete = stream_complete
+        retriever = _mock_retriever(chunks=[], pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7)
+
+        events = [e async for e in service.chat_stream("question", pinned_article_ids=["pub"])]
+        assert isinstance(events[-1], StreamFailed)
+        assert not any(isinstance(e, SourcesReady) for e in events)
+
+    @pytest.mark.asyncio
+    async def test_total_failure_before_any_output_propagates(self):
+        """The very first call is still safe to fail loudly — nothing has streamed yet, so the
+        router can still turn this into a clean 503 (see routers/chat.py)."""
+        def stream_complete(*args, **kwargs):
+            async def _gen():
+                if False:
+                    yield
+                raise AllProvidersExhausted()
+            return _gen()
+
+        llm = MagicMock()
+        llm.stream_complete = stream_complete
+        retriever = _mock_retriever(chunks=[], pinned_chunks=[_chunk()])
+        service = ChatService(retriever=retriever, llm=llm)
+
+        with pytest.raises(AllProvidersExhausted):
+            async for _ in service.chat_stream("question", pinned_article_ids=["pub"]):
+                pass
 
 
 # ── Context assembly ──────────────────────────────────────────────────────────

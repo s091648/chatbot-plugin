@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from itertools import groupby
 from typing import AsyncIterator
 
 from chatbot_plugin_sdk.contracts.responses import ChunkResult
@@ -28,7 +29,10 @@ _CITATION_PATTERN = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 SYSTEM_PROMPT = """\
 You are a research assistant that answers questions based ONLY on the
-provided context chunks. Each chunk is prefixed with [N] indicating its source article number.
+provided context. Context is grouped by source article; each group is prefixed with [N]
+indicating its article number. A single [N] group can contain several paragraphs separated
+by "---" — they are all still that one article, not separate numbered sources, so never cite
+a number higher than the highest [N] group actually shown below.
 
 Rules:
 - Answer using only the information in the context below.
@@ -41,7 +45,10 @@ Rules:
 
 PINNED_SYSTEM_PROMPT = """\
 You are a research assistant answering a question about one or more articles the user
-has explicitly pinned. Each context chunk is prefixed with [N] indicating its source article number.
+has explicitly pinned. Context is grouped by source article; each group is prefixed with [N]
+indicating its article number. A single [N] group can contain several paragraphs separated
+by "---" — they are all still that one article, not separate numbered sources, so never cite
+a number higher than the highest [N] group actually shown below.
 
 Rules:
 - Prefer answering using ONLY the pinned article context below.
@@ -57,6 +64,19 @@ Rules:
 _NO_RELEVANT_INFO_REPLY = (
     "I couldn't find relevant information in the database for your question. "
     "Please try rephrasing or ask about a different topic."
+)
+
+# The tool-call follow-up turn (tools=None — see _chat_pinned_stream/_chat_pinned) sometimes
+# finishes cleanly (finish_reason STOP) without producing any answer text at all: the model's own
+# thinking can indicate it wants to search again, but with tools disabled on that turn it can't,
+# and instead of falling back to answering with what it already has it just ends the turn with
+# nothing. See gemini_provider.py's stream()/complete() "empty output" warning logs for the
+# provider-side signal this pairs with. Unlike _NO_RELEVANT_INFO_REPLY, search *did* find
+# something here — the model just failed to use it — so a distinct message avoids implying the
+# database had nothing relevant.
+_EMPTY_FOLLOWUP_REPLY = (
+    "I found some information via search but wasn't able to put together a complete answer "
+    "from it. Please try rephrasing your question or asking again."
 )
 
 SEARCH_TOOL = ToolSpec(
@@ -140,6 +160,7 @@ class ChatService:
         max_tokens: int = 2048,
         min_score: float = 0.0,
         min_rerank_score: float = 0.0,
+        max_tool_rounds: int = 3,
     ) -> None:
         self._retriever = retriever
         self._llm = llm
@@ -147,6 +168,11 @@ class ChatService:
         self._max_tokens = max_tokens
         self._min_score = min_score
         self._min_rerank_score = min_rerank_score
+        # Only meaningful for the pinned-article flow (_chat_pinned/_chat_pinned_stream) — how
+        # many turns the model may use the search_articles tool before it's forced to answer
+        # with whatever it has (tools=None). Bounds an otherwise-unbounded agentic loop; not a
+        # literal count of tool *calls* (each round can request more than one).
+        self._max_tool_rounds = max_tool_rounds
 
     async def chat(
         self,
@@ -234,70 +260,103 @@ class ChatService:
             {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
         ]
 
-        # This first call is still safe to retry across providers on total failure (nothing
-        # streamed yet) — that fallback lives inside stream_complete itself, same as complete().
-        tool_calls: list[ToolCallRequest] = []
+        all_chunks = pinned_chunks
+        tool_executions: list[ToolCallExecution] = []
         handler: ProviderHandler | None = None
-        first_call_text: list[str] = []
-        async for h, event in self._llm.stream_complete(messages, self._max_tokens, tools=[SEARCH_TOOL]):
-            handler = h
-            if isinstance(event, StreamError):
-                yield StreamFailed(message=event.message)
+        round_num = 0
+        # Only a round whose tool calls actually carried a thought_signature needs to stay pinned
+        # to the exact same handler for the next call (Gemini's continuity requirement — echoing
+        # a *different* model's function-call part back gets a 400 INVALID_ARGUMENT). A round
+        # with no thought_signature at all (the handler wasn't a "thinking"-capable Gemini model,
+        # or didn't emit one) has nothing that needs preserving, so the next call is free to
+        # rotate across every other configured handler on failure, same as round 0 — pinning it
+        # anyway would strand a turn on one quota-exhausted model while sibling models configured
+        # specifically as fallbacks still had headroom, for no actual correctness benefit. See
+        # ToolCallRequest.thought_signature.
+        requires_pinning = False
+
+        # A model can legitimately want to search again with a different query after seeing the
+        # first result set — self._max_tool_rounds bounds how many times it's allowed to (rather
+        # than the old hardcoded "exactly one round trip, forced to answer immediately after"),
+        # while still guaranteeing termination: once round_num reaches the cap, tools is forced
+        # to None so the *next* call cannot request another tool call.
+        while True:
+            tools_for_round = [SEARCH_TOOL] if round_num < self._max_tool_rounds else None
+            call_tool_calls: list[ToolCallRequest] = []
+            call_text: list[str] = []
+            try:
+                # Only round 0 is safe to retry across providers on total failure (nothing
+                # streamed yet — that fallback lives inside stream_complete itself). Every round
+                # after that can no longer silently retry regardless of requires_pinning: prior
+                # rounds' output is already visible to the client, so a silent restart would
+                # produce a duplicated turn — the difference requires_pinning makes is *which*
+                # handler(s) stream_complete is allowed to try before giving up, not whether a
+                # failure past this point can retry silently.
+                stream = self._llm.stream_complete(
+                    messages, self._max_tokens, tools=tools_for_round,
+                    pinned_handler=handler if requires_pinning else None,
+                )
+                async for h, event in stream:
+                    handler = h
+                    if isinstance(event, StreamError):
+                        yield StreamFailed(message=event.message)
+                        return
+                    if isinstance(event, ToolCallRequest):
+                        call_tool_calls.append(event)
+                        continue
+                    if isinstance(event, TextDelta):
+                        call_text.append(event.text)
+                    yield event
+            except AllProvidersExhausted:
+                if round_num == 0:
+                    raise
+                yield StreamFailed(message="the model provider failed after the tool call")
                 return
-            if isinstance(event, ToolCallRequest):
-                tool_calls.append(event)
-                continue
-            if isinstance(event, TextDelta):
-                first_call_text.append(event.text)
-            yield event
 
-        if not tool_calls:
-            yield SourcesReady(articles=self._filter_cited_articles("".join(first_call_text), articles))
-            return
+            if not call_tool_calls:
+                break
 
-        # Emit "started" up front (id/name/arguments are already known from the tool_calls
-        # themselves) so the tool card can show a running state for the retrieval below,
-        # instead of only ever appearing already-finished.
-        for call in tool_calls:
-            yield ToolCallStarted(id=call.id, name=call.name, arguments=call.arguments)
+            requires_pinning = any(c.thought_signature for c in call_tool_calls)
 
-        tool_executions, tool_result_messages, all_chunks, articles, article_index = await self._execute_tool_calls(
-            tool_calls, pinned_chunks, articles, article_index
-        )
-        for execution in tool_executions:
-            yield ToolCallFinished(
-                id=execution.id, name=execution.name,
-                result_summary=execution.result_summary, is_error=execution.is_error,
+            # Emit "started" up front (id/name/arguments are already known from the tool_calls
+            # themselves) so the tool card can show a running state for the retrieval below,
+            # instead of only ever appearing already-finished.
+            for call in call_tool_calls:
+                yield ToolCallStarted(id=call.id, name=call.name, arguments=call.arguments)
+
+            round_executions, tool_result_messages, all_chunks, articles, article_index = await self._execute_tool_calls(
+                call_tool_calls, all_chunks, articles, article_index
             )
+            tool_executions.extend(round_executions)
+            for execution in round_executions:
+                yield ToolCallFinished(
+                    id=execution.id, name=execution.name,
+                    result_summary=execution.result_summary, is_error=execution.is_error,
+                )
 
-        messages.append({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": c.id, "name": c.name, "arguments": c.arguments, "thought_signature": c.thought_signature}
-                for c in tool_calls
-            ],
-        })
-        messages.extend(tool_result_messages)
+            messages.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": c.id, "name": c.name, "arguments": c.arguments, "thought_signature": c.thought_signature}
+                    for c in call_tool_calls
+                ],
+            })
+            messages.extend(tool_result_messages)
+            round_num += 1
 
-        # The follow-up call is pinned to the same handler (Gemini requires the same model that
-        # made the tool call for continuity — see thought_signature). It can no longer fall back
-        # to a different provider on failure: the tool call above has already been streamed to
-        # the client as visible output, so a silent restart would produce a duplicated turn.
-        reply_parts: list[str] = []
-        try:
-            async for _, event in self._llm.stream_complete(messages, self._max_tokens, tools=None, pinned_handler=handler):
-                if isinstance(event, StreamError):
-                    yield StreamFailed(message=event.message)
-                    return
-                if isinstance(event, TextDelta):
-                    reply_parts.append(event.text)
-                yield event
-        except AllProvidersExhausted:
-            yield StreamFailed(message="the model provider failed after the tool call")
-            return
+        # A round that used the search tool can still finish cleanly with zero text (see
+        # _EMPTY_FOLLOWUP_REPLY) — without this, the turn would settle with an empty assistant
+        # message and no visible explanation. Not applied to a round-0 reply with no tool calls
+        # at all: that's a different failure mode (no search context established yet) this isn't
+        # trying to cover. This text was never part of the model's own stream, so it's yielded
+        # here as its own TextDelta rather than folded silently into call_text.
+        reply = "".join(call_text)
+        if round_num > 0 and not reply.strip():
+            reply = _EMPTY_FOLLOWUP_REPLY
+            yield TextDelta(text=reply)
 
-        yield SourcesReady(articles=self._filter_cited_articles("".join(reply_parts), articles))
+        yield SourcesReady(articles=self._filter_cited_articles(reply, articles))
 
     async def _chat_pinned(self, message: str, pinned_article_ids: list[str]) -> ChatResult:
         exclude: set[str] = set()
@@ -310,36 +369,78 @@ class ChatService:
                 {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
             ]
 
-            result, handler = await self._llm.complete(messages, self._max_tokens, tools=[SEARCH_TOOL], exclude=exclude)
+            all_chunks = pinned_chunks
+            tool_executions: list[ToolCallExecution] = []
+            handler: ProviderHandler | None = None
+            result: LLMResult | None = None
+            round_num = 0
+            provider_failed = False
+            # See _chat_pinned_stream's equivalent flag for the full reasoning — only a round
+            # whose tool calls actually carried a thought_signature needs the next call pinned to
+            # the exact same handler; otherwise the next call is free to rotate across every
+            # other configured handler (same as round 0), so a quota-exhausted model doesn't
+            # strand the turn while sibling models configured as fallbacks still have headroom.
+            requires_pinning = False
 
-            if not result.tool_calls:
-                articles_used = self._filter_cited_articles(result.text, articles)
-                return ChatResult(reply=result.text, articles_used=articles_used, thinking=result.thinking, chunks=pinned_chunks)
+            # See _chat_pinned_stream's equivalent loop for the full reasoning — this mirrors it
+            # for the non-streaming path: the model gets up to self._max_tool_rounds turns with
+            # the search tool available (rather than the old hardcoded single round trip), with
+            # the last one forced tools=None so a final answer is guaranteed.
+            while True:
+                tools_for_round = [SEARCH_TOOL] if round_num < self._max_tool_rounds else None
+                try:
+                    if requires_pinning:
+                        result, handler = await self._llm.complete(messages, self._max_tokens, tools=tools_for_round, pinned_handler=handler)
+                    else:
+                        result, handler = await self._llm.complete(messages, self._max_tokens, tools=tools_for_round, exclude=exclude)
+                except AllProvidersExhausted:
+                    if round_num == 0:
+                        raise
+                    if not requires_pinning:
+                        # Not pinned to a single handler — complete() above already walked every
+                        # non-excluded candidate internally before raising, so there's nothing
+                        # left to retry with.
+                        raise
+                    # Pinned: only that one handler was tried, and prior rounds' tool calls are
+                    # only usable with it (Gemini continuity — see thought_signature), so a
+                    # failure here can't retry with a different one in place; restart the whole
+                    # attempt from scratch excluding it instead.
+                    exclude.add(handler.name)
+                    provider_failed = True
+                    break
 
-            tool_executions, tool_result_messages, all_chunks, articles, article_index = await self._execute_tool_calls(
-                result.tool_calls, pinned_chunks, articles, article_index
-            )
-            messages.append({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {"id": c.id, "name": c.name, "arguments": c.arguments, "thought_signature": c.thought_signature}
-                    for c in result.tool_calls
-                ],
-            })
-            messages.extend(tool_result_messages)
+                if not result.tool_calls:
+                    break
 
-            try:
-                final_result, _ = await self._llm.complete(messages, self._max_tokens, tools=None, pinned_handler=handler)
-            except AllProvidersExhausted:
-                exclude.add(handler.name)
+                round_executions, tool_result_messages, all_chunks, articles, article_index = await self._execute_tool_calls(
+                    result.tool_calls, all_chunks, articles, article_index
+                )
+                tool_executions.extend(round_executions)
+                requires_pinning = any(c.thought_signature for c in result.tool_calls)
+                messages.append({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": c.id, "name": c.name, "arguments": c.arguments, "thought_signature": c.thought_signature}
+                        for c in result.tool_calls
+                    ],
+                })
+                messages.extend(tool_result_messages)
+                round_num += 1
+
+            if provider_failed:
                 continue
 
-            articles_used = self._filter_cited_articles(final_result.text, articles)
+            # See _EMPTY_FOLLOWUP_REPLY — a round that used the search tool can still finish
+            # cleanly with zero text. Not applied to a round-0 reply with no tool calls at all:
+            # that's a different failure mode (no search context established yet) this isn't
+            # trying to cover.
+            reply = result.text if (round_num == 0 or result.text.strip()) else _EMPTY_FOLLOWUP_REPLY
+            articles_used = self._filter_cited_articles(reply, articles)
             return ChatResult(
-                reply=final_result.text,
+                reply=reply,
                 articles_used=articles_used,
-                thinking=final_result.thinking,
+                thinking=result.thinking,
                 chunks=all_chunks,
                 tool_calls_executed=tool_executions,
             )
@@ -465,9 +566,20 @@ class ChatService:
         return list(seen.values()), index
 
     def _build_context(self, chunks: list[ChunkResult], article_index: dict[str, int]) -> str:
+        """Groups chunks under one [N] header per article instead of repeating an identical
+        header on every chunk. A single pinned article can alone contribute up to
+        max_context_chunks chunks (see _fetch_pinned_chunks) — repeating "[1] Title" back to
+        back reads visually like a list of N distinct numbered things, and weaker fallback
+        models (observed with gemini-3.1-flash-lite after the primary model hit its daily quota)
+        have cited invented numbers like [3] or [9] based on chunk position rather than the
+        literal repeated [1] label, producing citations SourcesReady/_filter_cited_articles then
+        can't map back to any real article."""
+        ordered = sorted(chunks, key=lambda c: article_index.get(c.article_id, 0))
         parts = []
-        for chunk in chunks:
-            n = article_index.get(chunk.article_id, 0)
-            title = chunk.article_metadata.get("title") or "Unknown"
-            parts.append(f"[{n}] {title}\n{chunk.content}")
+        for article_id, group in groupby(ordered, key=lambda c: c.article_id):
+            group_chunks = list(group)
+            n = article_index.get(article_id, 0)
+            title = group_chunks[0].article_metadata.get("title") or "Unknown"
+            body = "\n---\n".join(c.content for c in group_chunks)
+            parts.append(f"[{n}] {title}\n{body}")
         return "\n\n".join(parts)

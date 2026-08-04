@@ -22,6 +22,7 @@ from chatbot_plugin.config import (
     RAG_RERANKER_MODEL,
     CHATBOT_MAX_CONTEXT_CHUNKS, CHATBOT_MAX_TOKENS,
     CHATBOT_RETRIEVAL_MIN_SCORE, CHATBOT_RERANKER_MIN_SCORE,
+    CHATBOT_MAX_TOOL_ROUNDS,
     APP_ENV, GRAFANA_LOKI_URL, GRAFANA_LOKI_USER, GRAFANA_API_KEY,
 )
 from chatbot_plugin.observability import configure_logging
@@ -99,6 +100,7 @@ async def lifespan(app: FastAPI):
         max_tokens=CHATBOT_MAX_TOKENS,
         min_score=CHATBOT_RETRIEVAL_MIN_SCORE,
         min_rerank_score=CHATBOT_RERANKER_MIN_SCORE,
+        max_tool_rounds=CHATBOT_MAX_TOOL_ROUNDS,
     )
 
     yield

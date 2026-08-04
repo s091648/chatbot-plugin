@@ -69,6 +69,7 @@ alembic/                         # Database migrations
 | `CHATBOT_RERANKER_MIN_SCORE` | `0.7` | Post-rerank score threshold |
 | `CHATBOT_MAX_CONTEXT_CHUNKS` | `10` | Max chunks in context |
 | `CHATBOT_MAX_TOKENS` | `2048` | Max LLM output tokens |
+| `CHATBOT_MAX_TOOL_ROUNDS` | `3` | Pinned-article flow only: max turns the model may use `search_articles` before being forced to answer |
 | `CHATBOT_CLAUDE_API_KEY` | `""` | Anthropic API key |
 | `CHATBOT_CLAUDE_MODEL` | `claude-sonnet-4-6-20250514` | Claude model |
 | `CHATBOT_GEMINI_API_KEY` | `""` | Google Gemini API key |

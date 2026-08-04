@@ -109,6 +109,17 @@ class GeminiProvider:
         thinking = "".join(thinking_chunks).strip() or None
         reply = "".join(reply_chunks).strip()
 
+        if not reply and not tool_calls:
+            # A normal (non-blocked) finish with no text and no tool call — the model produced
+            # thinking (or nothing at all) but never committed to either an answer or a next
+            # action. finish_reason is a legitimate STOP here, so the check above doesn't catch
+            # this; the caller (ChatService) can't tell "no text" apart from "no text because I
+            # forgot to look" without this log — see the equivalent check in stream() below.
+            logger.warning(
+                "gemini_no_actionable_output",
+                extra={"model": self.model, "finish_reason": fr_name, "has_thinking": thinking is not None},
+            )
+
         logger.info(
             "gemini_api_called",
             extra={
@@ -129,6 +140,9 @@ class GeminiProvider:
     ):
         contents, config = self._build_request(messages, max_tokens, tools)
 
+        finish_reason_name: str | None = None
+        produced_text = False
+        produced_tool_call = False
         try:
             response_stream = await self._client.aio.models.generate_content_stream(
                 model=self.model,
@@ -137,11 +151,21 @@ class GeminiProvider:
             )
             tool_call_index = 0
             async for chunk in response_stream:
-                if not chunk.candidates or chunk.candidates[0].content is None:
+                if not chunk.candidates:
                     continue
-                for p in chunk.candidates[0].content.parts:
+                candidate = chunk.candidates[0]
+                fr = candidate.finish_reason
+                if fr is not None:
+                    finish_reason_name = fr.name if hasattr(fr, "name") else str(fr)
+                # The terminal chunk carrying finish_reason often has content=None (nothing left
+                # to emit) — it must not be skipped before finish_reason above is read, or the
+                # blocked/empty-response checks below never see it.
+                if candidate.content is None:
+                    continue
+                for p in candidate.content.parts:
                     fc = getattr(p, "function_call", None)
                     if fc is not None:
+                        produced_tool_call = True
                         yield ToolCallRequest(
                             id=f"call_{tool_call_index}",
                             name=fc.name,
@@ -156,6 +180,7 @@ class GeminiProvider:
                     if getattr(p, "thought", False):
                         yield ThinkingDelta(text=text)
                     else:
+                        produced_text = True
                         yield TextDelta(text=text)
         except Exception as e:
             error_str = str(e)
@@ -163,7 +188,27 @@ class GeminiProvider:
                 raise RateLimitExhausted(f"Daily quota exceeded for {self.model}") from e
             raise
 
-        logger.info("gemini_stream_completed", extra={"model": self.model})
+        if finish_reason_name not in (None, "STOP", "1", "MAX_TOKENS"):
+            logger.warning(
+                "gemini_stream_blocked",
+                extra={"model": self.model, "finish_reason": finish_reason_name},
+            )
+        elif not produced_text and not produced_tool_call:
+            # Mirrors the equivalent check in complete() — a clean STOP that produced neither an
+            # answer nor a next action (only thinking, or nothing at all). This is exactly the
+            # failure mode chat_service.py's tool-call follow-up turn hit: the model's own
+            # thinking said it wanted to search again, but tools=None on that turn meant it
+            # couldn't — instead of falling back to answering with what it already had, it just
+            # ended the turn with nothing.
+            logger.warning(
+                "gemini_stream_empty_response",
+                extra={"model": self.model, "finish_reason": finish_reason_name},
+            )
+
+        logger.info(
+            "gemini_stream_completed",
+            extra={"model": self.model, "finish_reason": finish_reason_name},
+        )
 
     @staticmethod
     def _to_gemini_content(message: dict):

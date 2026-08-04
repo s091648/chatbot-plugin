@@ -12,6 +12,7 @@ from chatbot_plugin.services.chat_service import (
     SYSTEM_PROMPT,
     ToolCallFinished,
     ToolCallStarted,
+    _EMPTY_FOLLOWUP_REPLY,
 )
 from chatbot_plugin.llm.base import (
     AllProvidersExhausted,
@@ -484,7 +485,9 @@ class TestPinnedToolCalling:
     @pytest.mark.asyncio
     async def test_provider_failure_mid_exchange_restarts_with_next_provider(self):
         pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
-        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"})
+        # thought_signature present — this exercises the "must stay pinned" path (see
+        # TestFollowupHandlerPinning for the no-signature "free to rotate" counterpart).
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"}, thought_signature=b"sig-bytes")
         failing_handler = _fake_handler(name="failing")
         backup_handler = _fake_handler(name="backup")
 
@@ -513,6 +516,213 @@ class TestPinnedToolCalling:
         result = await service.chat("question", pinned_article_ids=None)
         assert result.tool_calls_executed == []
         assert result.reply == "Normal reply"
+
+
+# ── Follow-up handler pinning (regression) ──────────────────────────────────────
+# Pinning the follow-up call to whichever handler made the tool call exists only because Gemini
+# rejects a follow-up turn that echoes back a function-call part's thought_signature to a
+# *different* model (400 INVALID_ARGUMENT). A tool call with no thought_signature at all has
+# nothing that constraint applies to, so the follow-up should be free to rotate across every
+# other configured handler — pinning it anyway would strand a turn on one quota-exhausted model
+# while sibling models configured specifically as fallbacks still had headroom (the bug a real
+# user hit: gemini-3-flash-preview's 20/day cap exhausted, gemini-3.1-flash-lite's 500/day
+# sitting unused, and the pinned follow-up failed outright instead of trying it).
+
+class TestFollowupHandlerPinning:
+    @pytest.mark.asyncio
+    async def test_followup_is_not_pinned_when_tool_call_had_no_thought_signature(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"})  # no thought_signature
+
+        captured_kwargs = []
+
+        async def _complete(messages, max_tokens, tools=None, **kwargs):
+            captured_kwargs.append(kwargs)
+            if tools:
+                return (LLMResult(thinking=None, text="", tool_calls=[tool_call]), _fake_handler())
+            return (LLMResult(thinking=None, text="Final answer"), _fake_handler())
+
+        llm = AsyncMock()
+        llm.complete = AsyncMock(side_effect=_complete)
+        retriever = _mock_retriever(chunks=[], pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=1)
+
+        result = await service.chat("question", pinned_article_ids=["pub"])
+
+        assert result.reply == "Final answer"
+        assert len(captured_kwargs) == 2
+        assert "pinned_handler" not in captured_kwargs[1]
+        assert "exclude" in captured_kwargs[1]
+
+    @pytest.mark.asyncio
+    async def test_followup_is_pinned_when_tool_call_had_a_thought_signature(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"}, thought_signature=b"sig")
+        first_round_handler = _fake_handler(name="round0-handler")
+
+        captured_kwargs = []
+
+        async def _complete(messages, max_tokens, tools=None, **kwargs):
+            captured_kwargs.append(kwargs)
+            if tools:
+                return (LLMResult(thinking=None, text="", tool_calls=[tool_call]), first_round_handler)
+            return (LLMResult(thinking=None, text="Final answer"), first_round_handler)
+
+        llm = AsyncMock()
+        llm.complete = AsyncMock(side_effect=_complete)
+        retriever = _mock_retriever(chunks=[], pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=1)
+
+        result = await service.chat("question", pinned_article_ids=["pub"])
+
+        assert result.reply == "Final answer"
+        assert len(captured_kwargs) == 2
+        assert captured_kwargs[1].get("pinned_handler") is first_round_handler
+        assert "exclude" not in captured_kwargs[1]
+
+    @pytest.mark.asyncio
+    async def test_streaming_followup_is_not_pinned_when_tool_call_had_no_thought_signature(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"})  # no thought_signature
+
+        captured_kwargs = []
+
+        def stream_complete(messages, max_tokens, tools=None, **kwargs):
+            captured_kwargs.append(kwargs)
+            if tools:
+                return _stream_gen([tool_call])
+            return _stream_gen([TextDelta(text="Final answer")])
+
+        llm = MagicMock()
+        llm.stream_complete = stream_complete
+        retriever = _mock_retriever(chunks=[], pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=1)
+
+        events = [e async for e in service.chat_stream("question", pinned_article_ids=["pub"])]
+
+        text = "".join(e.text for e in events if isinstance(e, TextDelta))
+        assert text == "Final answer"
+        assert len(captured_kwargs) == 2
+        assert captured_kwargs[1].get("pinned_handler") is None
+
+    @pytest.mark.asyncio
+    async def test_streaming_followup_is_pinned_when_tool_call_had_a_thought_signature(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"}, thought_signature=b"sig")
+        handler = _fake_handler()
+
+        captured_kwargs = []
+
+        def stream_complete(messages, max_tokens, tools=None, **kwargs):
+            captured_kwargs.append(kwargs)
+            if tools:
+                return _stream_gen([tool_call], handler=handler)
+            return _stream_gen([TextDelta(text="Final answer")], handler=handler)
+
+        llm = MagicMock()
+        llm.stream_complete = stream_complete
+        retriever = _mock_retriever(chunks=[], pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=1)
+
+        events = [e async for e in service.chat_stream("question", pinned_article_ids=["pub"])]
+
+        text = "".join(e.text for e in events if isinstance(e, TextDelta))
+        assert text == "Final answer"
+        assert len(captured_kwargs) == 2
+        assert captured_kwargs[1].get("pinned_handler") is handler
+
+
+# ── Pinned tool calling — multiple rounds (non-streaming) ──────────────────────
+# The model isn't limited to exactly one tool-call round trip: it may search again with a
+# different query before answering, up to max_tool_rounds turns.
+
+class TestPinnedToolCallingMultiRound:
+    @pytest.mark.asyncio
+    async def test_answers_after_a_second_search_with_a_different_query(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        searched_chunks = [_chunk(chunk_id="s1", article_id="a-searched", title="Searched")]
+        first_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "AWS IoT Core"})
+        second_call = ToolCallRequest(id="call_2", name="search_articles", arguments={"query": "AWS IoT"})
+
+        llm = AsyncMock()
+        llm.complete = AsyncMock(side_effect=[
+            (LLMResult(thinking=None, text="", tool_calls=[first_call]), _fake_handler()),
+            (LLMResult(thinking=None, text="", tool_calls=[second_call]), _fake_handler()),
+            (LLMResult(thinking=None, text="Final answer citing [2]"), _fake_handler()),
+        ])
+
+        retriever = _mock_retriever(chunks=searched_chunks, pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=3)
+
+        result = await service.chat("broad question", pinned_article_ids=["pub"])
+
+        assert llm.complete.call_count == 3
+        assert len(result.tool_calls_executed) == 2
+        assert [c.name for c in result.tool_calls_executed] == ["search_articles", "search_articles"]
+        assert result.reply == "Final answer citing [2]"
+
+    @pytest.mark.asyncio
+    async def test_forces_a_final_answer_once_max_tool_rounds_is_reached(self):
+        """A model that keeps wanting to search forever must still be cut off — the round after
+        the cap gets tools=None, which the fake LLM here always answers with `tool_calls=[]` for
+        (matching what the real provider guarantees: no tools offered, none can be returned)."""
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        searched_chunks = [_chunk(chunk_id="s1", article_id="a-searched", title="Searched")]
+        endless_call = ToolCallRequest(id="call_x", name="search_articles", arguments={"query": "x"})
+
+        call_log: list[list] = []
+
+        async def _complete(messages, max_tokens, tools=None, pinned_handler=None, exclude=None):
+            call_log.append(tools)
+            if tools:
+                return (LLMResult(thinking=None, text="", tool_calls=[endless_call]), _fake_handler())
+            return (LLMResult(thinking=None, text="Giving up, here's what I found"), _fake_handler())
+
+        llm = AsyncMock()
+        llm.complete = AsyncMock(side_effect=_complete)
+        retriever = _mock_retriever(chunks=searched_chunks, pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=2)
+
+        result = await service.chat("question", pinned_article_ids=["pub"])
+
+        # 2 tool-enabled rounds + 1 forced tools=None round = 3 calls total
+        assert len(call_log) == 3
+        assert call_log[0] and call_log[1] and not call_log[2]
+        assert len(result.tool_calls_executed) == 2
+        assert result.reply == "Giving up, here's what I found"
+
+
+# ── Empty follow-up fallback ────────────────────────────────────────────────────
+# The model can finish a post-tool-call turn cleanly (no error) with zero answer text — see
+# gemini_provider.py's stream()/complete() "empty output" warning logs for the provider-side
+# signal this pairs with.
+
+class TestEmptyFollowupFallback:
+    @pytest.mark.asyncio
+    async def test_substitutes_fallback_text_when_followup_produces_no_text(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"})
+
+        llm = AsyncMock()
+        llm.complete = AsyncMock(side_effect=[
+            (LLMResult(thinking=None, text="", tool_calls=[tool_call]), _fake_handler()),
+            (LLMResult(thinking="wanted to search again but couldn't", text=""), _fake_handler()),
+        ])
+
+        retriever = _mock_retriever(chunks=[], pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=1)
+
+        result = await service.chat("question", pinned_article_ids=["pub"])
+        assert result.reply == _EMPTY_FOLLOWUP_REPLY
+
+    @pytest.mark.asyncio
+    async def test_does_not_substitute_fallback_when_no_tool_call_was_ever_made(self):
+        """An empty reply with no tool call at all is a different failure mode this fallback
+        isn't meant to cover — the raw (possibly empty) text passes through unchanged."""
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        service = _service(pinned_chunks=pinned_chunks, reply="")
+        result = await service.chat("question", pinned_article_ids=["pub"])
+        assert result.reply == ""
 
 
 # ── Pinned tool calling (streaming) ─────────────────────────────────────────────
@@ -545,7 +755,9 @@ class TestPinnedToolCallingStreaming:
     async def test_tool_call_streams_started_finished_then_follow_up_text(self):
         pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
         searched_chunks = [_chunk(chunk_id="s1", article_id="a-searched", title="Searched")]
-        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "broader topic"})
+        # thought_signature present — this is what actually requires the follow-up call to stay
+        # pinned to the same handler (see TestFollowupHandlerPinning for the no-signature case).
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "broader topic"}, thought_signature=b"sig-bytes")
         handler = _fake_handler()
 
         def stream_complete(messages, max_tokens, tools=None, pinned_handler=None, exclude=None):
@@ -557,7 +769,11 @@ class TestPinnedToolCallingStreaming:
         llm = MagicMock()
         llm.stream_complete = stream_complete
         retriever = _mock_retriever(chunks=searched_chunks, pinned_chunks=pinned_chunks)
-        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7)
+        # This mock's stream_complete branches only on "tools truthy or not" (no round
+        # awareness) — max_tool_rounds=1 keeps it a single-round scenario, matching what it was
+        # testing before the multi-round loop existed. See TestPinnedToolCallingMultiRound for
+        # coverage of rounds beyond the first.
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=1)
 
         events = [e async for e in service.chat_stream("broad question", pinned_article_ids=["pub"])]
 
@@ -590,7 +806,8 @@ class TestPinnedToolCallingStreaming:
         llm = MagicMock()
         llm.stream_complete = stream_complete
         retriever = _mock_retriever(chunks=[], pinned_chunks=pinned_chunks)
-        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7)
+        # Same reasoning as the previous test — this mock isn't round-aware.
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=1)
 
         events = [e async for e in service.chat_stream("question", pinned_article_ids=["pub"])]
         assert isinstance(events[-1], StreamFailed)
@@ -615,6 +832,96 @@ class TestPinnedToolCallingStreaming:
         with pytest.raises(AllProvidersExhausted):
             async for _ in service.chat_stream("question", pinned_article_ids=["pub"]):
                 pass
+
+
+# ── Pinned tool calling — multiple rounds (streaming) ───────────────────────────
+
+class TestPinnedToolCallingStreamingMultiRound:
+    @pytest.mark.asyncio
+    async def test_streams_two_tool_rounds_then_final_text(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        searched_chunks = [_chunk(chunk_id="s1", article_id="a-searched", title="Searched")]
+        # thought_signature present on both — each round's follow-up must stay pinned to the
+        # same handler (see TestFollowupHandlerPinning for the no-signature case).
+        first_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "AWS IoT Core"}, thought_signature=b"sig-1")
+        second_call = ToolCallRequest(id="call_2", name="search_articles", arguments={"query": "AWS IoT"}, thought_signature=b"sig-2")
+        handler = _fake_handler()
+
+        call_count = 0
+
+        def stream_complete(messages, max_tokens, tools=None, pinned_handler=None, exclude=None):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return _stream_gen([first_call], handler=handler)
+            if call_count == 2:
+                assert pinned_handler is handler
+                return _stream_gen([second_call], handler=handler)
+            assert pinned_handler is handler
+            return _stream_gen([TextDelta(text="Final answer citing [2]")], handler=handler)
+
+        llm = MagicMock()
+        llm.stream_complete = stream_complete
+        retriever = _mock_retriever(chunks=searched_chunks, pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=3)
+
+        events = [e async for e in service.chat_stream("broad question", pinned_article_ids=["pub"])]
+
+        started = [e for e in events if isinstance(e, ToolCallStarted)]
+        finished = [e for e in events if isinstance(e, ToolCallFinished)]
+        text = "".join(e.text for e in events if isinstance(e, TextDelta))
+        assert [e.id for e in started] == ["call_1", "call_2"]
+        assert len(finished) == 2
+        assert text == "Final answer citing [2]"
+        assert call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_forces_final_answer_once_max_tool_rounds_is_reached(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        searched_chunks = [_chunk(chunk_id="s1", article_id="a-searched", title="Searched")]
+        endless_call = ToolCallRequest(id="call_x", name="search_articles", arguments={"query": "x"})
+
+        call_log: list[list] = []
+
+        def stream_complete(messages, max_tokens, tools=None, pinned_handler=None, exclude=None):
+            call_log.append(tools)
+            if tools:
+                return _stream_gen([endless_call])
+            return _stream_gen([TextDelta(text="Giving up, here's what I found")])
+
+        llm = MagicMock()
+        llm.stream_complete = stream_complete
+        retriever = _mock_retriever(chunks=searched_chunks, pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=2)
+
+        events = [e async for e in service.chat_stream("question", pinned_article_ids=["pub"])]
+
+        assert len(call_log) == 3
+        assert call_log[0] and call_log[1] and not call_log[2]
+        text = "".join(e.text for e in events if isinstance(e, TextDelta))
+        assert text == "Giving up, here's what I found"
+
+    @pytest.mark.asyncio
+    async def test_yields_fallback_text_delta_when_followup_produces_no_text(self):
+        pinned_chunks = [_chunk(chunk_id="pin1", article_id="a-pinned", title="Pinned")]
+        tool_call = ToolCallRequest(id="call_1", name="search_articles", arguments={"query": "x"})
+        handler = _fake_handler()
+
+        def stream_complete(messages, max_tokens, tools=None, pinned_handler=None, exclude=None):
+            if tools:
+                return _stream_gen([tool_call], handler=handler)
+            return _stream_gen([ThinkingDelta(text="wanted to search again but couldn't")], handler=handler)
+
+        llm = MagicMock()
+        llm.stream_complete = stream_complete
+        retriever = _mock_retriever(chunks=[], pinned_chunks=pinned_chunks)
+        service = ChatService(retriever=retriever, llm=llm, min_score=0.3, min_rerank_score=0.7, max_tool_rounds=1)
+
+        events = [e async for e in service.chat_stream("question", pinned_article_ids=["pub"])]
+
+        text = "".join(e.text for e in events if isinstance(e, TextDelta))
+        assert text == _EMPTY_FOLLOWUP_REPLY
+        assert isinstance(events[-1], SourcesReady)
 
 
 # ── Context assembly ──────────────────────────────────────────────────────────
@@ -643,6 +950,39 @@ class TestContextAssembly:
         context = service._build_context(chunks, index)
         assert "Unknown" in context
         assert "Some text." in context
+
+    # Regression: a single pinned article can alone contribute up to max_context_chunks chunks
+    # (see _fetch_pinned_chunks). Previously _build_context repeated "[1] Title" once per chunk,
+    # which a weaker fallback model (gemini-3.1-flash-lite) mistook for a numbered list of
+    # distinct sources — inventing citations like [3]/[9] from chunk position instead of the
+    # literal repeated [1] label. Grouping under one header per article removes that misleading
+    # repeated-numbered-list shape entirely.
+    def test_build_context_groups_multiple_chunks_from_the_same_article_under_one_header(self):
+        chunks = [
+            _chunk(chunk_id="c1", article_id="a1", title="Same Article", content="First chunk."),
+            _chunk(chunk_id="c2", article_id="a1", title="Same Article", content="Second chunk."),
+            _chunk(chunk_id="c3", article_id="a1", title="Same Article", content="Third chunk."),
+        ]
+        service = self._make_service(chunks)
+        _, index = service._collect_articles(chunks)
+        context = service._build_context(chunks, index)
+        assert context.count("[1] Same Article") == 1
+        assert "First chunk." in context
+        assert "Second chunk." in context
+        assert "Third chunk." in context
+
+    def test_build_context_orders_by_article_index_even_when_chunks_interleave(self):
+        chunks = [
+            _chunk(chunk_id="c1", article_id="a1", title="Article One", content="A1 chunk."),
+            _chunk(chunk_id="c2", article_id="a2", title="Article Two", content="A2 chunk."),
+            _chunk(chunk_id="c3", article_id="a1", title="Article One", content="A1 chunk 2."),
+        ]
+        service = self._make_service(chunks)
+        _, index = service._collect_articles(chunks)
+        context = service._build_context(chunks, index)
+        assert context.count("[1] Article One") == 1
+        assert context.count("[2] Article Two") == 1
+        assert context.index("[1] Article One") < context.index("[2] Article Two")
 
     def test_collect_articles_deduplicates(self):
         chunks = [

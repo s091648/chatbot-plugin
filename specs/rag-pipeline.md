@@ -84,9 +84,11 @@ Score Gate (ChatService)
     │
     ▼
 Context Assembly (ChatService)
-    │ Format chunks as:
-    │   [source: Article Title]
+    │ Group chunks by article, one [N] header per article (not per chunk):
+    │   [N] Article Title
     │   Chunk content...
+    │   ---
+    │   Another chunk from the same article...
     │
     ▼
 ResilientLLMService (llm/base.py)
@@ -107,11 +109,56 @@ OpenAI-compatible response: POST /v1/chat/completions
 - Accepts `messages: list[Message]` (OpenAI format)
 - Extracts the last `user` message as the RAG query
 - Calls `RetrieveProcessor.retrieve(...)` with configured thresholds
-- Assembles context string with `[source: title]` annotations
+- Assembles context string via `_build_context`, one `[N] Title` header per unique **article**
+  (`_collect_articles` numbers articles, not chunks, in first-appearance order) — chunks from
+  the same article are grouped under that one header, separated by `---`, rather than each chunk
+  repeating its own `[N] Title` line
 - Calls `ResilientLLMService.generate(system_prompt, context, user_message)`
 - Returns `ChatResult(reply: str, articles: list[ArticleRef])`
 
-`SYSTEM_PROMPT` (defined in `chat_service.py`) instructs the LLM to answer based only on the provided context.
+`SYSTEM_PROMPT`/`PINNED_SYSTEM_PROMPT` (defined in `chat_service.py`) instruct the LLM to answer
+based only on the provided context and to never cite an `[N]` higher than the highest group
+actually present. This grouping (rather than one header per chunk) matters most for the
+pinned-article flow: a single pinned article can alone contribute up to `max_context_chunks`
+chunks (see `_fetch_pinned_chunks`), and repeating an identical `[1] Title` header that many
+times in a row visually reads like a numbered list of that many distinct sources — weaker
+fallback models (observed with `gemini-3.1-flash-lite`, a rate-limit fallback for the primary
+model) have cited invented numbers like `[3]` or `[9]` based on chunk position instead of the
+literal repeated `[1]` label. Those invented numbers don't correspond to any entry in
+`articles`, so `_filter_cited_articles` silently drops them — the reply then contains `[3]`/`[9]`
+markers the frontend renders as inert literal text (out of range for the returned `sources`
+list) alongside one correctly-linked `[1]` citation.
+
+### Pinned-Article Tool Calling
+
+> This section covers only the pinned-article + tool-calling path (`_chat_pinned`/`_chat_pinned_stream`,
+> `PINNED_SYSTEM_PROMPT`) and its `max_tool_rounds` cap. The rest of this document (streaming
+> event types, thinking-delta passthrough) predates that flow and isn't fully reconciled with it yet.
+
+When a request pins one or more articles, `ChatService` first answers from just the pinned
+article context (`PINNED_SYSTEM_PROMPT`). If that context is insufficient, the model may call
+`search_articles` to query the full corpus.
+
+- The model is **not** limited to a single tool-call round trip. It may call `search_articles`
+  again with a different query (e.g. after an unproductive first search) for up to
+  `CHATBOT_MAX_TOOL_ROUNDS` turns (default `3`) before the next call is forced `tools=None`,
+  guaranteeing the turn terminates with a text answer rather than looping indefinitely.
+- A round's follow-up call is pinned to the same provider `ProviderHandler` **only if** that
+  round's tool call(s) actually carried a `ToolCallRequest.thought_signature` — Gemini requires
+  the exact same model for `thought_signature` continuity across a tool-call round trip and
+  rejects a follow-up that echoes it back to a different one (400 INVALID_ARGUMENT). A round
+  whose tool calls carried no signature (the handler wasn't a "thinking"-capable Gemini model, or
+  didn't emit one) has nothing to preserve, so its follow-up is free to rotate across every other
+  configured handler on failure, same as the very first call. Unconditional pinning previously
+  meant a single quota-exhausted model could fail a whole turn outright even when sibling models
+  configured specifically as fallbacks still had headroom.
+- A round that *did* call the tool can still finish cleanly (no error, normal `finish_reason`)
+  with zero answer text — the model's own reasoning can indicate an intent to search again that
+  it can't act on once the round cap forces `tools=None`. When that happens the turn is not left
+  empty: it's substituted with a fixed fallback string (`_EMPTY_FOLLOWUP_REPLY` in
+  `chat_service.py`) instead of returning nothing. This substitution only applies to a round that
+  used the tool at least once — a round-0 reply with no tool call and no text is a different,
+  unrelated failure mode.
 
 ### ResilientLLMService
 
@@ -178,6 +225,7 @@ CREATE INDEX hnsw_chunks_dense ON article_chunks
 | `CHATBOT_RERANKER_MIN_SCORE` | `0.7` | Post-rerank score threshold |
 | `CHATBOT_MAX_CONTEXT_CHUNKS` | `10` | Max chunks in context |
 | `CHATBOT_MAX_TOKENS` | `2048` | Max LLM output tokens |
+| `CHATBOT_MAX_TOOL_ROUNDS` | `3` | Pinned-article flow only: max turns the model may use `search_articles` before being forced to answer — see "Pinned-Article Tool Calling" above |
 | `CHATBOT_CLAUDE_API_KEY` | `""` | Anthropic API key |
 | `CHATBOT_CLAUDE_MODEL` | `claude-sonnet-4-6-20250514` | Claude model |
 | `CHATBOT_GEMINI_API_KEY` | `""` | Google Gemini API key |

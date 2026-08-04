@@ -51,6 +51,9 @@ CHATBOT_MAX_CONTEXT_CHUNKS: int = int(os.environ.get("CHATBOT_MAX_CONTEXT_CHUNKS
 CHATBOT_MAX_TOKENS: int = int(os.environ.get("CHATBOT_MAX_TOKENS", "2048"))
 CHATBOT_RETRIEVAL_MIN_SCORE: float = float(os.environ.get("CHATBOT_RETRIEVAL_MIN_SCORE", "0.0"))
 CHATBOT_RERANKER_MIN_SCORE: float = float(os.environ.get("CHATBOT_RERANKER_MIN_SCORE", "0.0"))
+# Pinned-article flow only: how many turns the model may use the search_articles tool before
+# being forced to answer with tools=None. See ChatService._chat_pinned_stream/_chat_pinned.
+CHATBOT_MAX_TOOL_ROUNDS: int = int(os.environ.get("CHATBOT_MAX_TOOL_ROUNDS", "3"))
 
 # Auth
 CHAT_SERVICE_API_KEY: str = os.environ.get("CHAT_SERVICE_API_KEY", "")

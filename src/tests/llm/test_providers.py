@@ -291,10 +291,12 @@ class TestGeminiProvider:
         provider = GeminiProvider(api_key="test-key")
         thinking_part = MagicMock(text="pondering", thought=True, function_call=None)
         text_part = MagicMock(text="Hello", thought=False, function_call=None)
+        stop = MagicMock()
+        stop.name = "STOP"
 
         async def _chunks():
-            yield MagicMock(candidates=[MagicMock(content=MagicMock(parts=[thinking_part]))])
-            yield MagicMock(candidates=[MagicMock(content=MagicMock(parts=[text_part]))])
+            yield MagicMock(candidates=[MagicMock(finish_reason=None, content=MagicMock(parts=[thinking_part]))])
+            yield MagicMock(candidates=[MagicMock(finish_reason=stop, content=MagicMock(parts=[text_part]))])
 
         with patch.object(provider._client.aio.models, "generate_content_stream", new_callable=AsyncMock, return_value=_chunks()):
             events = [e async for e in provider.stream(MESSAGES, 100)]
@@ -307,9 +309,11 @@ class TestGeminiProvider:
         fc_mock.name = "search_articles"
         fc_part = MagicMock(text=None, thought=False, thought_signature=b"sig-bytes")
         fc_part.function_call = fc_mock
+        stop = MagicMock()
+        stop.name = "STOP"
 
         async def _chunks():
-            yield MagicMock(candidates=[MagicMock(content=MagicMock(parts=[fc_part]))])
+            yield MagicMock(candidates=[MagicMock(finish_reason=stop, content=MagicMock(parts=[fc_part]))])
 
         with patch.object(provider._client.aio.models, "generate_content_stream", new_callable=AsyncMock, return_value=_chunks()):
             events = [e async for e in provider.stream(MESSAGES, 100, tools=[ToolSpec("search_articles", "d", {})])]
@@ -326,6 +330,86 @@ class TestGeminiProvider:
             with pytest.raises(RateLimitExhausted):
                 async for _ in provider.stream(MESSAGES, 100):
                     pass
+
+    # ── finish_reason / empty-output diagnostics (regression) ──────────────────────────────
+    # Root cause of the original silent-empty-response bug: the terminal chunk carrying
+    # finish_reason typically has content=None and was being skipped before finish_reason was
+    # ever read, so neither a blocked completion nor a clean-but-empty one was ever logged.
+
+    @pytest.mark.asyncio
+    async def test_stream_logs_warning_when_blocked(self, caplog):
+        provider = GeminiProvider(api_key="test-key")
+        blocked = MagicMock()
+        blocked.name = "SAFETY"
+
+        async def _chunks():
+            # The terminal chunk: content=None, finish_reason set — exactly the chunk the old
+            # code's `or chunk.candidates[0].content is None: continue` skipped before ever
+            # looking at finish_reason.
+            yield MagicMock(candidates=[MagicMock(finish_reason=blocked, content=None)])
+
+        with caplog.at_level("WARNING"):
+            with patch.object(provider._client.aio.models, "generate_content_stream", new_callable=AsyncMock, return_value=_chunks()):
+                events = [e async for e in provider.stream(MESSAGES, 100)]
+        assert events == []
+        assert any(r.message == "gemini_stream_blocked" for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_stream_logs_warning_when_finished_cleanly_with_no_output(self):
+        """The exact bug a real user hit: finish_reason STOP (not blocked), but only a thinking
+        delta was ever produced — no text, no tool call."""
+        provider = GeminiProvider(api_key="test-key")
+        thinking_part = MagicMock(text="thinking about it...", thought=True, function_call=None)
+        stop = MagicMock()
+        stop.name = "STOP"
+
+        async def _chunks():
+            yield MagicMock(candidates=[MagicMock(finish_reason=None, content=MagicMock(parts=[thinking_part]))])
+            yield MagicMock(candidates=[MagicMock(finish_reason=stop, content=None)])
+
+        with patch.object(provider._client.aio.models, "generate_content_stream", new_callable=AsyncMock, return_value=_chunks()):
+            with patch("chatbot_plugin.llm.gemini_provider.logger") as mock_logger:
+                events = [e async for e in provider.stream(MESSAGES, 100)]
+        assert events == [ThinkingDelta(text="thinking about it...")]
+        mock_logger.warning.assert_any_call(
+            "gemini_stream_empty_response",
+            extra={"model": provider.model, "finish_reason": "STOP"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_stream_does_not_warn_when_text_was_produced(self):
+        provider = GeminiProvider(api_key="test-key")
+        text_part = MagicMock(text="Hello", thought=False, function_call=None)
+        stop = MagicMock()
+        stop.name = "STOP"
+
+        async def _chunks():
+            yield MagicMock(candidates=[MagicMock(finish_reason=stop, content=MagicMock(parts=[text_part]))])
+
+        with patch.object(provider._client.aio.models, "generate_content_stream", new_callable=AsyncMock, return_value=_chunks()):
+            with patch("chatbot_plugin.llm.gemini_provider.logger") as mock_logger:
+                events = [e async for e in provider.stream(MESSAGES, 100)]
+        assert events == [TextDelta(text="Hello")]
+        warned = [c for c in mock_logger.warning.call_args_list if c.args and c.args[0].startswith("gemini_stream")]
+        assert warned == []
+
+    @pytest.mark.asyncio
+    async def test_complete_logs_warning_when_no_reply_text_and_no_tool_calls(self):
+        provider = GeminiProvider(api_key="test-key")
+        thinking_part = MagicMock(text="thinking about it...", thought=True, function_call=None)
+        mock_response = MagicMock()
+        mock_response.text = ""
+        finish_reason = MagicMock()
+        finish_reason.name = "STOP"
+        mock_response.candidates = [MagicMock(finish_reason=finish_reason, content=MagicMock(parts=[thinking_part]))]
+        with patch.object(provider._client.models, "generate_content", return_value=mock_response):
+            with patch("chatbot_plugin.llm.gemini_provider.logger") as mock_logger:
+                result = await provider.complete(MESSAGES, 100)
+        assert result.text == ""
+        mock_logger.warning.assert_any_call(
+            "gemini_no_actionable_output",
+            extra={"model": provider.model, "finish_reason": "STOP", "has_thinking": True},
+        )
 
 
 class TestOpenRouterProvider:

@@ -1,6 +1,6 @@
 [project]
 name = "chatbot-plugin"
-version = "1.0.1"
+version = "1.0.2"
 description = "OpenAI-compatible RAG chat backend"
 requires-python = ">=3.11"
 dependencies = [

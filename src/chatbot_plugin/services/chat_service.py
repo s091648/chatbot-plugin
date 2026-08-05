@@ -95,6 +95,13 @@ class ArticleRef:
     title: str | None
     url: str
     public_article_id: str | None = None
+    # 1-based index of this article's [N] group in the context sent to the LLM (same value as
+    # article_index[id] in _collect_articles/_build_context). _filter_cited_articles narrows
+    # articles down to only the ones actually cited, which can leave gaps (e.g. context had
+    # articles 1-4 but only [1] and [3] got cited) — without carrying the original number along,
+    # a consumer indexing into the resulting list by array position would silently map a citation
+    # to the wrong article once the list is no longer a contiguous 1..k prefix.
+    number: int = 0
 
 
 @dataclass
@@ -511,6 +518,10 @@ class ChatService:
     def _filter_cited_articles(self, reply: str, articles: list[ArticleRef]) -> list[ArticleRef]:
         """Keeps only the context articles whose [N] index is actually cited in the reply.
 
+        The returned list can be a non-contiguous subset (e.g. only [1] and [3] cited out of
+        four context articles) — each ArticleRef.number still holds its original context index,
+        so a consumer can resolve a citation correctly without relying on array position.
+
         Falls back to returning every context article when the reply has no citations at all
         (e.g. the model ignored the instruction) — better to over-show sources than show none.
         """
@@ -556,24 +567,30 @@ class ChatService:
             if chunk.article_id not in seen:
                 meta = chunk.article_metadata
                 raw_pid = meta.get("public_article_id")
+                number = len(seen) + 1
                 seen[chunk.article_id] = ArticleRef(
                     id=chunk.article_id,
                     title=meta.get("title"),
                     url=meta.get("url") or "",
                     public_article_id=str(raw_pid) if raw_pid is not None else None,
+                    number=number,
                 )
-                index[chunk.article_id] = len(seen)
+                index[chunk.article_id] = number
         return list(seen.values()), index
 
     def _build_context(self, chunks: list[ChunkResult], article_index: dict[str, int]) -> str:
         """Groups chunks under one [N] header per article instead of repeating an identical
         header on every chunk. A single pinned article can alone contribute up to
         max_context_chunks chunks (see _fetch_pinned_chunks) — repeating "[1] Title" back to
-        back reads visually like a list of N distinct numbered things, and weaker fallback
-        models (observed with gemini-3.1-flash-lite after the primary model hit its daily quota)
-        have cited invented numbers like [3] or [9] based on chunk position rather than the
-        literal repeated [1] label, producing citations SourcesReady/_filter_cited_articles then
-        can't map back to any real article."""
+        back reads visually like a list of N distinct numbered things, and models (observed with
+        gemini-3.1-flash-lite after the primary model hit its daily quota, but not exclusive to
+        it) still cite invented numbers like [3] or [9] based on chunk/paragraph position rather
+        than the literal repeated [1] label, producing citations SourcesReady/_filter_cited_articles
+        then can't map back to any real article. The trailing range line below restates the exact
+        valid bound for *this* request (rather than SYSTEM_PROMPT/PINNED_SYSTEM_PROMPT's generic
+        wording) as one more layer against that — it reduces but doesn't eliminate the hallucination,
+        so the frontend (cited-content.tsx's parseInline) is the layer that actually guarantees an
+        invented number never reaches the user as a broken-looking citation."""
         ordered = sorted(chunks, key=lambda c: article_index.get(c.article_id, 0))
         parts = []
         for article_id, group in groupby(ordered, key=lambda c: c.article_id):
@@ -582,4 +599,13 @@ class ChatService:
             title = group_chunks[0].article_metadata.get("title") or "Unknown"
             body = "\n---\n".join(c.content for c in group_chunks)
             parts.append(f"[{n}] {title}\n{body}")
+        if article_index:
+            max_n = max(article_index.values())
+            bound = "1" if max_n == 1 else f"1 to {max_n}"
+            parts.append(
+                f"(This context contains exactly {max_n} article(s), numbered {bound}. "
+                "A single article's content may be split into several paragraphs above — that "
+                "does not make it multiple sources. Every citation you write must be one of "
+                f"{bound}; never invent any other number.)"
+            )
         return "\n\n".join(parts)

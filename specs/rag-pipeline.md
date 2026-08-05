@@ -121,13 +121,42 @@ based only on the provided context and to never cite an `[N]` higher than the hi
 actually present. This grouping (rather than one header per chunk) matters most for the
 pinned-article flow: a single pinned article can alone contribute up to `max_context_chunks`
 chunks (see `_fetch_pinned_chunks`), and repeating an identical `[1] Title` header that many
-times in a row visually reads like a numbered list of that many distinct sources — weaker
-fallback models (observed with `gemini-3.1-flash-lite`, a rate-limit fallback for the primary
-model) have cited invented numbers like `[3]` or `[9]` based on chunk position instead of the
-literal repeated `[1]` label. Those invented numbers don't correspond to any entry in
-`articles`, so `_filter_cited_articles` silently drops them — the reply then contains `[3]`/`[9]`
-markers the frontend renders as inert literal text (out of range for the returned `sources`
-list) alongside one correctly-linked `[1]` citation.
+times in a row visually reads like a numbered list of that many distinct sources — models
+(observed with `gemini-3.1-flash-lite`, a rate-limit fallback for the primary model, but not
+exclusive to it) have cited invented numbers like `[3]` or `[9]` based on chunk/paragraph
+position instead of the literal repeated `[1]` label — confirmed in production on a single
+pinned article, where one reply scattered `[2, 3]`, `[3, 6]`, `[9]`, `[4, 5, 8]` through the
+text despite only `[1]` being real.
+
+This is mitigated in two layers, since neither alone can guarantee correctness:
+
+1. **`_build_context` appends a dynamic range line** (`"This context contains exactly N
+   article(s), numbered 1 to N..."`) restating the *exact* valid bound for the current request,
+   rather than relying only on `SYSTEM_PROMPT`/`PINNED_SYSTEM_PROMPT`'s generic wording. This
+   reduces how often a model invents a number, but an LLM can't be constrained to 100%
+   compliance by prompting alone — hallucinated numbers still get through sometimes.
+2. **`cited-content.tsx`'s `parseInline` resolves each number in a `[N]`/`[N, M, ...]` group
+   independently** rather than all-or-nothing: a number that matches a real entry in `sources`
+   renders its pill, a number that doesn't is silently dropped (not shown as literal text). This
+   is the layer that actually guarantees the user never sees a broken-looking `[9]` — it works
+   regardless of how well the backend prompt performs, and applies uniformly whether the group
+   is fully invented (`[9]`) or partially real (`[1, 3]` when only article 1 exists).
+
+`_filter_cited_articles` still narrows `articles_used`/the `sources` SSE payload down to only
+entries with at least one real citation — invented numbers never create a phantom source entry,
+they just don't survive into the rendered text either.
+
+`_filter_cited_articles` narrows `articles` down to only the ones actually cited, which is
+frequently a non-contiguous subset of the original numbering — e.g. a 4-article context where
+the reply cites only `[2]` and `[4]` returns a 2-element list. A consumer that resolved a `[N]`
+marker by array position (`sources[N-1]`) would desync here: `[4]`'s realistic position is index
+1, not 3. To prevent this, every `ArticleRef` (and the `number` field on each entry of the
+`sources` SSE payload / `articles_used`) carries its *original* 1-based context index — the same
+value used to label its `[N]` group in `_build_context` — so a marker can always be resolved by
+matching `number`, independent of where the article ended up in the filtered list. The frontend
+(`cited-content.tsx`'s `resolveSourceIndex`) does this lookup by `number` when present, falling
+back to positional indexing only for callers (e.g. the weekly-report widget) whose `sources`
+list is never narrowed and so has no `number` to give.
 
 ### Pinned-Article Tool Calling
 

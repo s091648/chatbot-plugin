@@ -242,6 +242,26 @@ class TestChatService:
         ]
         result = await _service(chunks=chunks, reply="See [1, 3] for details.").chat("q")
         assert [a.id for a in result.articles_used] == ["a1", "a3"]
+        # The returned list is a compacted (non-contiguous) subset of the 3 context articles —
+        # .number must still hold each article's *original* context index so a consumer can
+        # resolve the literal "[1]"/"[3]" in the reply without relying on array position.
+        assert [a.number for a in result.articles_used] == [1, 3]
+
+    @pytest.mark.asyncio
+    async def test_chat_cited_article_numbers_survive_non_contiguous_filtering(self):
+        """Regression test: citing articles 2 and 4 out of 4 (skipping 1 and 3) used to leave
+        articles_used == [article2, article4] with no way to tell that the reply's "[2]" refers
+        to the first entry and "[4]" to the second — a naive array-position lookup would map
+        "[2]" to the second entry (article4) instead. See ArticleRef.number."""
+        chunks = [
+            _chunk(chunk_id="c1", article_id="a1", title="Article 1"),
+            _chunk(chunk_id="c2", article_id="a2", title="Article 2"),
+            _chunk(chunk_id="c3", article_id="a3", title="Article 3"),
+            _chunk(chunk_id="c4", article_id="a4", title="Article 4"),
+        ]
+        result = await _service(chunks=chunks, reply="See [2] and [4] for details.").chat("q")
+        assert [a.id for a in result.articles_used] == ["a2", "a4"]
+        assert [a.number for a in result.articles_used] == [2, 4]
 
     @pytest.mark.asyncio
     async def test_chat_returns_all_articles_when_reply_has_no_citations(self):
@@ -983,6 +1003,28 @@ class TestContextAssembly:
         assert context.count("[1] Article One") == 1
         assert context.count("[2] Article Two") == 1
         assert context.index("[1] Article One") < context.index("[2] Article Two")
+
+    def test_build_context_appends_valid_citation_range_for_single_article(self):
+        chunks = [
+            _chunk(chunk_id="c1", article_id="a1", title="Same Article", content="First chunk."),
+            _chunk(chunk_id="c2", article_id="a1", title="Same Article", content="Second chunk."),
+        ]
+        service = self._make_service(chunks)
+        _, index = service._collect_articles(chunks)
+        context = service._build_context(chunks, index)
+        assert "exactly 1 article" in context
+        assert "must be one of 1;" in context
+
+    def test_build_context_appends_valid_citation_range_for_multiple_articles(self):
+        chunks = [
+            _chunk(chunk_id="c1", article_id="a1", title="Article One"),
+            _chunk(chunk_id="c2", article_id="a2", title="Article Two"),
+            _chunk(chunk_id="c3", article_id="a3", title="Article Three"),
+        ]
+        service = self._make_service(chunks)
+        _, index = service._collect_articles(chunks)
+        context = service._build_context(chunks, index)
+        assert "exactly 3 article(s), numbered 1 to 3" in context
 
     def test_collect_articles_deduplicates(self):
         chunks = [

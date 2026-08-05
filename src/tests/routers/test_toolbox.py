@@ -185,7 +185,7 @@ class TestStreamingResponse:
         events = [
             TextDelta(text="Answer"),
             SourcesReady(articles=[
-                ArticleRef(id="vec-id", title="My Article", url="https://example.com", public_article_id="pub-uuid"),
+                ArticleRef(id="vec-id", title="My Article", url="https://example.com", public_article_id="pub-uuid", number=1),
             ]),
         ]
         with patch.object(ChatService, "chat_stream", _fake_chat_stream(events)):
@@ -201,6 +201,9 @@ class TestStreamingResponse:
             sources = json.loads(sources_line[6:])["sources"]
             assert sources[0]["id"] == "vec-id"
             assert sources[0]["public_article_id"] == "pub-uuid"
+            # Frontend resolves a "[N]" citation marker by this number, not array position — see
+            # ArticleRef.number and cited-content.tsx's resolveSourceIndex.
+            assert sources[0]["number"] == 1
 
     @pytest.mark.asyncio
     async def test_stream_omits_sources_event_when_no_articles(self, client: AsyncClient):

@@ -137,7 +137,13 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 return []
             sources_payload = {
                 "sources": [
-                    {"id": ref.id, "title": ref.title, "url": ref.url, "public_article_id": ref.public_article_id}
+                    {
+                        "id": ref.id,
+                        "title": ref.title,
+                        "url": ref.url,
+                        "public_article_id": ref.public_article_id,
+                        "number": ref.number,
+                    }
                     for ref in event.articles
                 ]
             }

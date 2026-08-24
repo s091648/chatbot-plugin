@@ -63,3 +63,8 @@ APP_ENV: str = os.environ.get("APP_ENV", "local")
 GRAFANA_LOKI_URL: str = os.environ.get("GRAFANA_LOKI_URL", "")
 GRAFANA_LOKI_USER: str = os.environ.get("GRAFANA_LOKI_USER", "")
 GRAFANA_API_KEY: str = os.environ.get("GRAFANA_API_KEY", "")
+# Same Grafana Cloud tenant/credentials as the main scrape-analyzer repo's
+# backend/src (.env already has these) — OTel traces just land under this
+# service's own service.name, no new secrets needed.
+GRAFANA_OTLP_ENDPOINT: str = os.environ.get("GRAFANA_OTLP_ENDPOINT", "")
+GRAFANA_OTLP_USER: str = os.environ.get("GRAFANA_OTLP_USER", "")

@@ -14,10 +14,25 @@ dependencies = [
     "httpx",
     "tenacity",
     "python-logging-loki>=0.3",
+    # Listed explicitly here on purpose, not left to arrive transitively —
+    # chatbot-plugin-sdk only depends on opentelemetry-api itself as an
+    # *optional* `otel` extra (GeminiDenseProvider/RetrieveProcessor fall
+    # back to a no-op tracer when it's absent), so this app must keep
+    # declaring the full otel stack itself for its own setup_tracing()
+    # (observability.py) and FastAPI/SQLAlchemy/httpx instrumentation to
+    # keep working. Do not remove these under the assumption the SDK
+    # provides them — see specs/integration.md's "SDK Dependency" section.
+    "opentelemetry-api",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
+    "opentelemetry-instrumentation",
+    "opentelemetry-instrumentation-fastapi",
+    "opentelemetry-instrumentation-sqlalchemy",
+    "opentelemetry-instrumentation-httpx",
 ]
 
 [tool.uv.sources]
-chatbot-plugin-sdk = { git = "https://github.com/s091648/chatbot-plugin-sdk.git", tag = "v1.0.3" }
+chatbot-plugin-sdk = { git = "https://github.com/s091648/chatbot-plugin-sdk.git", tag = "v1.1.0" }
 
 [dependency-groups]
 dev = [

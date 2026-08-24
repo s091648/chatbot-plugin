@@ -79,6 +79,8 @@ This service depends on `chatbot-plugin-sdk`, which provides:
 
 `RetrieveProcessor` and `AsyncPgBackend` are wired up at startup in `main.py` lifespan and injected into `ChatService`.
 
+**Tracing note**: `GeminiDenseProvider`/`RetrieveProcessor` accept an optional `tracer` constructor argument (`chatbot_plugin_sdk.Tracer` protocol) and otherwise resolve one themselves via `default_tracer()`: real OpenTelemetry if `opentelemetry-api` is importable, else a built-in no-op — as of the SDK version this app pins, `opentelemetry-api` is only an *optional* `otel` extra there, not a hard dependency. This app doesn't pass `tracer=` explicitly and doesn't need to: `pyproject.toml` lists the full `opentelemetry-*` stack as its own top-level dependency, so the SDK's provider/processor spans keep landing on the same real `TracerProvider` `observability.py`'s `setup_tracing()` configures — nothing to change here. **Do not remove that dependency block** under the assumption the SDK brings it in transitively: unlike the SDK, this app does *not* degrade gracefully without it — `llm/gemini_provider.py` and `services/chat_service.py` both have an unconditional top-level `from opentelemetry import trace` (only `observability.py`'s own `setup_tracing()` is try/except-guarded), so a missing `opentelemetry-api` would fail the app at import time, before it even starts serving.
+
 ## Environment Variables
 
 All variables use the `CHATBOT_` prefix:
@@ -156,3 +158,4 @@ CREATE INDEX hnsw_chunks_dense ON article_chunks
 - `google-generativeai` — Gemini API client
 - `httpx` — async HTTP client (OpenRouter + embedding service)
 - `chatbot-plugin-sdk` — `RetrieveProcessor`, `AsyncPgBackend`, `EndpointProvider`, `SlidingWindowStrategy`
+- `opentelemetry-api`, `opentelemetry-sdk`, `opentelemetry-exporter-otlp-proto-http`, `opentelemetry-instrumentation{,-fastapi,-sqlalchemy,-httpx}` — this app's own tracing setup (`observability.py`). Required directly by this app, not merely convenient — see the tracing note under "SDK Dependency" above for why this must stay a top-level dependency here even though `chatbot-plugin-sdk` no longer requires it itself.

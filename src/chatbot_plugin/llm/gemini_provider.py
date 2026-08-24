@@ -4,11 +4,13 @@ import asyncio
 import logging
 
 from google import genai
+from opentelemetry import trace
 
 from chatbot_plugin_sdk import RateLimitExhausted
 from chatbot_plugin.llm.base import LLMResult, TextDelta, ThinkingDelta, ToolCallRequest, ToolSpec
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer(__name__)
 
 
 class GeminiProvider:
@@ -143,50 +145,83 @@ class GeminiProvider:
         finish_reason_name: str | None = None
         produced_text = False
         produced_tool_call = False
+        # start_span() + manual end() in a try/finally, NOT start_as_current_span() as a
+        # `with` — this generator `yield`s to its caller (chat_service.py's own
+        # chat.pinned_round span) while this span is still open, and per the same
+        # opentelemetry-python gotcha documented on chat.llm_stream/chat.pinned_round in
+        # chat_service.py, a span held open across a `yield` must not use the
+        # "current span" context-manager form.
+        #
+        # "first_chunk" vs "first_content" are deliberately two different events: Gemini
+        # can send preliminary chunks (empty candidates, or a candidate with no usable
+        # part) before any real output — separating "a chunk arrived at all" from "a
+        # chunk with actual text/tool-call content arrived" tells you whether a slow
+        # round is waiting on the network/TTFB or on Gemini silently thinking through a
+        # string of not-yet-useful chunks.
+        span = _tracer.start_span("gemini.stream", attributes={"model": self.model})
+        chunk_count = 0
         try:
-            response_stream = await self._client.aio.models.generate_content_stream(
-                model=self.model,
-                contents=contents,
-                config=config,
-            )
-            tool_call_index = 0
-            async for chunk in response_stream:
-                if not chunk.candidates:
-                    continue
-                candidate = chunk.candidates[0]
-                fr = candidate.finish_reason
-                if fr is not None:
-                    finish_reason_name = fr.name if hasattr(fr, "name") else str(fr)
-                # The terminal chunk carrying finish_reason often has content=None (nothing left
-                # to emit) — it must not be skipped before finish_reason above is read, or the
-                # blocked/empty-response checks below never see it.
-                if candidate.content is None:
-                    continue
-                for p in candidate.content.parts:
-                    fc = getattr(p, "function_call", None)
-                    if fc is not None:
-                        produced_tool_call = True
-                        yield ToolCallRequest(
-                            id=f"call_{tool_call_index}",
-                            name=fc.name,
-                            arguments=dict(fc.args or {}),
-                            thought_signature=getattr(p, "thought_signature", None),
-                        )
-                        tool_call_index += 1
+            try:
+                response_stream = await self._client.aio.models.generate_content_stream(
+                    model=self.model,
+                    contents=contents,
+                    config=config,
+                )
+                span.add_event("request_sent")
+                tool_call_index = 0
+                first_content_seen = False
+                async for chunk in response_stream:
+                    if chunk_count == 0:
+                        span.add_event("first_chunk")
+                    chunk_count += 1
+                    if not chunk.candidates:
                         continue
-                    text = getattr(p, "text", None)
-                    if not text:
+                    candidate = chunk.candidates[0]
+                    fr = candidate.finish_reason
+                    if fr is not None:
+                        finish_reason_name = fr.name if hasattr(fr, "name") else str(fr)
+                    # The terminal chunk carrying finish_reason often has content=None (nothing left
+                    # to emit) — it must not be skipped before finish_reason above is read, or the
+                    # blocked/empty-response checks below never see it.
+                    if candidate.content is None:
                         continue
-                    if getattr(p, "thought", False):
-                        yield ThinkingDelta(text=text)
-                    else:
-                        produced_text = True
-                        yield TextDelta(text=text)
-        except Exception as e:
-            error_str = str(e)
-            if "RESOURCE_EXHAUSTED" in error_str and "PerDay" in error_str:
-                raise RateLimitExhausted(f"Daily quota exceeded for {self.model}") from e
-            raise
+                    for p in candidate.content.parts:
+                        fc = getattr(p, "function_call", None)
+                        if fc is not None:
+                            if not first_content_seen:
+                                first_content_seen = True
+                                span.add_event("first_content", {"kind": "tool_call"})
+                            produced_tool_call = True
+                            yield ToolCallRequest(
+                                id=f"call_{tool_call_index}",
+                                name=fc.name,
+                                arguments=dict(fc.args or {}),
+                                thought_signature=getattr(p, "thought_signature", None),
+                            )
+                            tool_call_index += 1
+                            continue
+                        text = getattr(p, "text", None)
+                        if not text:
+                            continue
+                        if getattr(p, "thought", False):
+                            if not first_content_seen:
+                                first_content_seen = True
+                                span.add_event("first_content", {"kind": "thinking"})
+                            yield ThinkingDelta(text=text)
+                        else:
+                            if not first_content_seen:
+                                first_content_seen = True
+                                span.add_event("first_content", {"kind": "text"})
+                            produced_text = True
+                            yield TextDelta(text=text)
+            except Exception as e:
+                error_str = str(e)
+                if "RESOURCE_EXHAUSTED" in error_str and "PerDay" in error_str:
+                    raise RateLimitExhausted(f"Daily quota exceeded for {self.model}") from e
+                raise
+        finally:
+            span.set_attribute("chunk_count", chunk_count)
+            span.end()
 
         if finish_reason_name not in (None, "STOP", "1", "MAX_TOKENS"):
             logger.warning(

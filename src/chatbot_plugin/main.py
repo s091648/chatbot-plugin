@@ -24,8 +24,9 @@ from chatbot_plugin.config import (
     CHATBOT_RETRIEVAL_MIN_SCORE, CHATBOT_RERANKER_MIN_SCORE,
     CHATBOT_MAX_TOOL_ROUNDS,
     APP_ENV, GRAFANA_LOKI_URL, GRAFANA_LOKI_USER, GRAFANA_API_KEY,
+    GRAFANA_OTLP_ENDPOINT, GRAFANA_OTLP_USER,
 )
-from chatbot_plugin.observability import configure_logging
+from chatbot_plugin.observability import configure_logging, setup_tracing
 from chatbot_plugin.routers import api_router
 from chatbot_plugin.services.chat_service import ChatService
 from chatbot_plugin.llm.gemini_provider import GeminiProvider
@@ -47,6 +48,7 @@ configure_logging(
     loki_api_key=GRAFANA_API_KEY,
     app_env=APP_ENV,
 )
+_tracer_provider = setup_tracing(APP_ENV, GRAFANA_OTLP_ENDPOINT, GRAFANA_OTLP_USER, GRAFANA_API_KEY)
 
 
 @asynccontextmanager
@@ -106,6 +108,8 @@ async def lifespan(app: FastAPI):
     yield
 
     await backend.close()
+    if _tracer_provider:
+        _tracer_provider.shutdown()
 
 
 app = FastAPI(
@@ -114,5 +118,9 @@ app = FastAPI(
     version="0.3.0",
     lifespan=lifespan,
 )
+
+if _tracer_provider:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    FastAPIInstrumentor.instrument_app(app, tracer_provider=_tracer_provider)
 
 app.include_router(api_router)

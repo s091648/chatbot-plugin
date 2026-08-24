@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from itertools import groupby
 from typing import AsyncIterator
 
+from opentelemetry import trace
+
 from chatbot_plugin_sdk.contracts.responses import ChunkResult
 from chatbot_plugin.llm.base import (
     AllProvidersExhausted,
@@ -21,6 +23,10 @@ from chatbot_plugin.llm.base import (
 from chatbot_plugin_sdk.processors.retrieve import RetrieveProcessor
 
 logger = logging.getLogger(__name__)
+# opentelemetry-api's default tracer is a documented no-op when no SDK/TracerProvider
+# is configured (e.g. local dev without GRAFANA_OTLP_* set) — safe to use
+# unconditionally, same pattern as the main scrape-analyzer repo's get_tracer().
+_tracer = trace.get_tracer(__name__)
 
 # Matches inline citations the system prompt asks the model to produce, e.g. "[1]" or the
 # grouped form "[1, 2]" — used to work out which of the context articles were actually cited
@@ -227,13 +233,15 @@ class ChatService:
                 yield event
             return
 
-        search_result = await self._retriever.retrieve(
-            message,
-            top_k=self._max_context_chunks,
-            min_score=self._min_score,
-            min_rerank_score=self._min_rerank_score,
-            filters={"topic_id": topic_id} if topic_id else None,
-        )
+        with _tracer.start_as_current_span("chat.retrieve") as retrieve_span:
+            search_result = await self._retriever.retrieve(
+                message,
+                top_k=self._max_context_chunks,
+                min_score=self._min_score,
+                min_rerank_score=self._min_rerank_score,
+                filters={"topic_id": topic_id} if topic_id else None,
+            )
+            retrieve_span.set_attribute("chunk_count", len(search_result.chunks))
         merged = search_result.chunks[: self._max_context_chunks]
         if not merged:
             yield TextDelta(text=_NO_RELEVANT_INFO_REPLY)
@@ -248,18 +256,43 @@ class ChatService:
         ]
 
         reply_parts: list[str] = []
-        async for _, event in self._llm.stream_complete(messages, self._max_tokens):
-            if isinstance(event, StreamError):
-                yield StreamFailed(message=event.message)
-                return
-            if isinstance(event, TextDelta):
-                reply_parts.append(event.text)
-            yield event
+        # "chat.llm_stream" spans the whole call; the "first_event" span event marks
+        # how much of that was silence before any byte reached the client — the
+        # number that actually answers "why is time-to-first-byte high" (as measured
+        # in a browser network tab), which neither this layer nor retrieval had any
+        # instrumentation for before this (no postgres/LLM spans either).
+        #
+        # Deliberately start_span() + manual end() in a try/finally, NOT
+        # start_as_current_span() as a `with` — this block `yield`s to the ASGI
+        # StreamingResponse machinery while the span is still open, and that can
+        # resume this generator in a different contextvars.Context than the one
+        # the span's __enter__ attached, which makes __exit__'s context detach
+        # raise "Failed to detach context: ... created in a different Context"
+        # (a known opentelemetry-python gotcha with async generators that yield
+        # across a held span). start_span() never touches "current span" context
+        # at all, so there's nothing to detach.
+        llm_span = _tracer.start_span("chat.llm_stream")
+        try:
+            first_event_seen = False
+            async for _, event in self._llm.stream_complete(messages, self._max_tokens):
+                if not first_event_seen:
+                    first_event_seen = True
+                    llm_span.add_event("first_event")
+                if isinstance(event, StreamError):
+                    yield StreamFailed(message=event.message)
+                    return
+                if isinstance(event, TextDelta):
+                    reply_parts.append(event.text)
+                yield event
+        finally:
+            llm_span.end()
 
         yield SourcesReady(articles=self._filter_cited_articles("".join(reply_parts), articles))
 
     async def _chat_pinned_stream(self, message: str, pinned_article_ids: list[str]) -> AsyncIterator[ChatStreamEvent]:
-        pinned_chunks = (await self._fetch_pinned_chunks(message, pinned_article_ids))[: self._max_context_chunks]
+        with _tracer.start_as_current_span("chat.retrieve_pinned") as fetch_span:
+            pinned_chunks = (await self._fetch_pinned_chunks(message, pinned_article_ids))[: self._max_context_chunks]
+            fetch_span.set_attribute("chunk_count", len(pinned_chunks))
         articles, article_index = self._collect_articles(pinned_chunks)
         context = self._build_context(pinned_chunks, article_index) if pinned_chunks else "(no content available for the pinned article(s))"
         messages = [
@@ -291,34 +324,55 @@ class ChatService:
             tools_for_round = [SEARCH_TOOL] if round_num < self._max_tool_rounds else None
             call_tool_calls: list[ToolCallRequest] = []
             call_text: list[str] = []
+            # "chat.pinned_round" spans the whole round; the "first_event" span event is
+            # the number that matters for "why is time-to-first-byte so high" — a
+            # tool-calling round (round_num > 0, or round 0 if the model decides to call
+            # search_articles) can burn several seconds here with nothing visible to the
+            # client at all, since a ToolCallRequest only emits once fully assembled (see
+            # LLMStreamEvent's docstring in llm/base.py) and no TextDelta exists yet for a
+            # pure tool-call turn.
+            #
+            # start_span() + manual end() in a try/finally, NOT start_as_current_span()
+            # as a `with` — see chat.llm_stream's comment above for why a span held open
+            # across a `yield` in an async generator must not use the "current span"
+            # context-manager form (it breaks context detach once the generator resumes
+            # in a different contextvars.Context than the one that attached it).
+            round_span = _tracer.start_span("chat.pinned_round", attributes={"round": round_num})
+            first_event_seen = False
             try:
-                # Only round 0 is safe to retry across providers on total failure (nothing
-                # streamed yet — that fallback lives inside stream_complete itself). Every round
-                # after that can no longer silently retry regardless of requires_pinning: prior
-                # rounds' output is already visible to the client, so a silent restart would
-                # produce a duplicated turn — the difference requires_pinning makes is *which*
-                # handler(s) stream_complete is allowed to try before giving up, not whether a
-                # failure past this point can retry silently.
-                stream = self._llm.stream_complete(
-                    messages, self._max_tokens, tools=tools_for_round,
-                    pinned_handler=handler if requires_pinning else None,
-                )
-                async for h, event in stream:
-                    handler = h
-                    if isinstance(event, StreamError):
-                        yield StreamFailed(message=event.message)
-                        return
-                    if isinstance(event, ToolCallRequest):
-                        call_tool_calls.append(event)
-                        continue
-                    if isinstance(event, TextDelta):
-                        call_text.append(event.text)
-                    yield event
-            except AllProvidersExhausted:
-                if round_num == 0:
-                    raise
-                yield StreamFailed(message="the model provider failed after the tool call")
-                return
+                try:
+                    # Only round 0 is safe to retry across providers on total failure (nothing
+                    # streamed yet — that fallback lives inside stream_complete itself). Every round
+                    # after that can no longer silently retry regardless of requires_pinning: prior
+                    # rounds' output is already visible to the client, so a silent restart would
+                    # produce a duplicated turn — the difference requires_pinning makes is *which*
+                    # handler(s) stream_complete is allowed to try before giving up, not whether a
+                    # failure past this point can retry silently.
+                    stream = self._llm.stream_complete(
+                        messages, self._max_tokens, tools=tools_for_round,
+                        pinned_handler=handler if requires_pinning else None,
+                    )
+                    async for h, event in stream:
+                        if not first_event_seen:
+                            first_event_seen = True
+                            round_span.add_event("first_event", {"provider": getattr(h, "name", "") or ""})
+                        handler = h
+                        if isinstance(event, StreamError):
+                            yield StreamFailed(message=event.message)
+                            return
+                        if isinstance(event, ToolCallRequest):
+                            call_tool_calls.append(event)
+                            continue
+                        if isinstance(event, TextDelta):
+                            call_text.append(event.text)
+                        yield event
+                except AllProvidersExhausted:
+                    if round_num == 0:
+                        raise
+                    yield StreamFailed(message="the model provider failed after the tool call")
+                    return
+            finally:
+                round_span.end()
 
             if not call_tool_calls:
                 break
@@ -331,9 +385,12 @@ class ChatService:
             for call in call_tool_calls:
                 yield ToolCallStarted(id=call.id, name=call.name, arguments=call.arguments)
 
-            round_executions, tool_result_messages, all_chunks, articles, article_index = await self._execute_tool_calls(
-                call_tool_calls, all_chunks, articles, article_index
-            )
+            with _tracer.start_as_current_span(
+                "chat.pinned_tool_calls", attributes={"round": round_num, "tool_call_count": len(call_tool_calls)}
+            ):
+                round_executions, tool_result_messages, all_chunks, articles, article_index = await self._execute_tool_calls(
+                    call_tool_calls, all_chunks, articles, article_index
+                )
             tool_executions.extend(round_executions)
             for execution in round_executions:
                 yield ToolCallFinished(

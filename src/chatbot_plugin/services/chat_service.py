@@ -207,8 +207,9 @@ class ChatService:
         if not merged:
             return ChatResult(reply=_NO_RELEVANT_INFO_REPLY, articles_used=[], chunks=[])
 
-        articles, article_index = self._collect_articles(merged)
-        context = self._build_context(merged, article_index)
+        with _tracer.start_as_current_span("chat.build_context"):
+            articles, article_index = self._collect_articles(merged)
+            context = self._build_context(merged, article_index)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
@@ -248,8 +249,9 @@ class ChatService:
             yield SourcesReady(articles=[])
             return
 
-        articles, article_index = self._collect_articles(merged)
-        context = self._build_context(merged, article_index)
+        with _tracer.start_as_current_span("chat.build_context"):
+            articles, article_index = self._collect_articles(merged)
+            context = self._build_context(merged, article_index)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
@@ -293,8 +295,9 @@ class ChatService:
         with _tracer.start_as_current_span("chat.retrieve_pinned") as fetch_span:
             pinned_chunks = (await self._fetch_pinned_chunks(message, pinned_article_ids))[: self._max_context_chunks]
             fetch_span.set_attribute("chunk_count", len(pinned_chunks))
-        articles, article_index = self._collect_articles(pinned_chunks)
-        context = self._build_context(pinned_chunks, article_index) if pinned_chunks else "(no content available for the pinned article(s))"
+        with _tracer.start_as_current_span("chat.build_context"):
+            articles, article_index = self._collect_articles(pinned_chunks)
+            context = self._build_context(pinned_chunks, article_index) if pinned_chunks else "(no content available for the pinned article(s))"
         messages = [
             {"role": "system", "content": PINNED_SYSTEM_PROMPT},
             {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
@@ -426,8 +429,9 @@ class ChatService:
         exclude: set[str] = set()
         while True:
             pinned_chunks = (await self._fetch_pinned_chunks(message, pinned_article_ids))[: self._max_context_chunks]
-            articles, article_index = self._collect_articles(pinned_chunks)
-            context = self._build_context(pinned_chunks, article_index) if pinned_chunks else "(no content available for the pinned article(s))"
+            with _tracer.start_as_current_span("chat.build_context"):
+                articles, article_index = self._collect_articles(pinned_chunks)
+                context = self._build_context(pinned_chunks, article_index) if pinned_chunks else "(no content available for the pinned article(s))"
             messages = [
                 {"role": "system", "content": PINNED_SYSTEM_PROMPT},
                 {"role": "user", "content": f"{context}\n\nQuestion: {message}"},
@@ -560,9 +564,10 @@ class ChatService:
             new_chunks = [c for c in search_result.chunks if c.chunk_id not in seen_chunk_ids]
             seen_chunk_ids.update(c.chunk_id for c in new_chunks)
             all_chunks.extend(new_chunks)
-            new_articles, article_index = self._collect_articles(new_chunks, seen=seen_articles, index=article_index)
-            seen_articles = {a.id: a for a in new_articles}
-            result_content = self._build_context(new_chunks, article_index) if new_chunks else "No additional results found."
+            with _tracer.start_as_current_span("chat.build_context"):
+                new_articles, article_index = self._collect_articles(new_chunks, seen=seen_articles, index=article_index)
+                seen_articles = {a.id: a for a in new_articles}
+                result_content = self._build_context(new_chunks, article_index) if new_chunks else "No additional results found."
 
             tool_executions.append(ToolCallExecution(call.id, call.name, call.arguments, result_content, False))
             tool_result_messages.append({
